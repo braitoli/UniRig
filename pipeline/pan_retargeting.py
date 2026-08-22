@@ -93,10 +93,11 @@ class PANMotionRetargeter:
                     tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot_vals})
 
         elif preset_name == "Walk_Retargeted":
-            # Retargeted walking stride with pelvic roll & counter-arm swing
+            # Realistic walking gait: asymmetric stance/swing phase, knee flexion & ankle push-off
             root_trans = np.tile(root_orig_trans, (num_frames, 1))
-            root_trans[:, up_axis] += 0.04 * skel_height * np.abs(np.sin(2.0 * np.pi * times / duration))
-            root_trans[:, lr_axis] += 0.02 * skel_height * np.sin(np.pi * times / duration)
+            # Dip down twice per stride during double support
+            root_trans[:, up_axis] += 0.035 * skel_height * (0.5 - 0.5 * np.cos(4.0 * np.pi * times / duration))
+            root_trans[:, lr_axis] += 0.025 * skel_height * np.sin(2.0 * np.pi * times / duration)
 
             tracks.append({
                 "joint_idx": root_idx,
@@ -105,116 +106,155 @@ class PANMotionRetargeter:
                 "values": root_trans
             })
 
-            # Retarget pelvis & spine roll
+            # Retarget pelvis yaw & spine counter-twist
             for s_idx in self.classifier.spine_chain:
                 rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                 for f in range(num_frames):
                     phase = 2.0 * np.pi * times[f] / duration
-                    rot_vals[f] = euler_to_quat(0.04 * np.sin(phase), 0.05 * np.cos(phase), 0.02 * np.sin(2*phase))
+                    # Spine slight forward lean (0.05) + pelvic yaw rotation (0.06) + sway (0.03)
+                    rot_vals[f] = euler_to_quat(0.05 + 0.03 * np.sin(2*phase), 0.06 * np.sin(phase), 0.03 * np.cos(phase))
                 tracks.append({"joint_idx": s_idx, "path": "rotation", "times": times, "values": rot_vals})
 
-            # Retarget left leg branches
+            # Left leg branches
             for b_idx, branch in enumerate(left_branches_sorted):
                 branch_phase_offset = 0.0 if b_idx == 0 else np.pi
                 for idx, leg_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + branch_phase_offset
-                        if idx == 0: # Hip / Thigh
-                            rot_vals[f] = euler_to_quat(0.42 * np.sin(phase), 0.0, 0.02 * np.cos(phase))
-                        elif idx == 1: # Knee flex
-                            flex = -0.35 * np.maximum(0.0, np.sin(phase))
+                        norm_phase = phase % (2.0 * np.pi)
+                        if idx == 0: # Hip / Thigh (Pitch & Roll)
+                            thigh_pitch = 0.12 + 0.42 * np.sin(norm_phase)
+                            rot_vals[f] = euler_to_quat(thigh_pitch, 0.0, 0.03 * np.cos(norm_phase))
+                        elif idx == 1: # Knee flex (Deep flexion during swing, extension before heel strike)
+                            flex = -0.85 * (np.maximum(0.0, np.sin(norm_phase)) ** 1.3)
                             rot_vals[f] = euler_to_quat(flex, 0.0, 0.0)
-                        else: # Foot/Ankle
-                            rot_vals[f] = euler_to_quat(-0.1 * np.sin(phase), 0.0, 0.0)
+                        else: # Ankle (Dorsiflexion on contact + Plantarflexion on push-off)
+                            ankle_pitch = 0.22 * np.sin(norm_phase - 0.4)
+                            rot_vals[f] = euler_to_quat(ankle_pitch, 0.0, 0.0)
                     tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot_vals})
 
-            # Retarget right leg branches (Opposite phase to left legs)
+            # Right leg branches (Opposite phase to left legs)
             for b_idx, branch in enumerate(right_branches_sorted):
                 branch_phase_offset = np.pi if b_idx == 0 else 0.0
                 for idx, leg_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + branch_phase_offset
+                        norm_phase = phase % (2.0 * np.pi)
                         if idx == 0: # Hip / Thigh
-                            rot_vals[f] = euler_to_quat(0.42 * np.sin(phase), 0.0, -0.02 * np.cos(phase))
+                            thigh_pitch = 0.12 + 0.42 * np.sin(norm_phase)
+                            rot_vals[f] = euler_to_quat(thigh_pitch, 0.0, -0.03 * np.cos(norm_phase))
                         elif idx == 1: # Knee flex
-                            flex = -0.35 * np.maximum(0.0, np.sin(phase))
+                            flex = -0.85 * (np.maximum(0.0, np.sin(norm_phase)) ** 1.3)
                             rot_vals[f] = euler_to_quat(flex, 0.0, 0.0)
-                        else: # Foot/Ankle
-                            rot_vals[f] = euler_to_quat(-0.1 * np.sin(phase), 0.0, 0.0)
+                        else: # Ankle
+                            ankle_pitch = 0.22 * np.sin(norm_phase - 0.4)
+                            rot_vals[f] = euler_to_quat(ankle_pitch, 0.0, 0.0)
                     tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot_vals})
 
-            # Retarget arm branches
+            # Left Arm (Shoulder counter-swing & Elbow flexion)
             for branch in self.classifier.left_arm_branches:
-                for arm_j in branch:
+                for idx, arm_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + np.pi
-                        rot_vals[f] = euler_to_quat(0.32 * np.sin(phase), 0.0, 0.08 * np.cos(phase))
+                        if idx == 0: # Shoulder
+                            rot_vals[f] = euler_to_quat(0.38 * np.sin(phase), 0.0, 0.08 * np.cos(phase))
+                        else: # Elbow (bent ~35 deg + extra flex on swing)
+                            elbow_flex = -0.45 - 0.25 * np.maximum(0.0, np.sin(phase))
+                            rot_vals[f] = euler_to_quat(elbow_flex, 0.0, 0.0)
                     tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot_vals})
 
+            # Right Arm (Shoulder counter-swing & Elbow flexion)
             for branch in self.classifier.right_arm_branches:
-                for arm_j in branch:
+                for idx, arm_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration
-                        rot_vals[f] = euler_to_quat(0.32 * np.sin(phase), 0.0, -0.08 * np.cos(phase))
+                        if idx == 0: # Shoulder
+                            rot_vals[f] = euler_to_quat(0.38 * np.sin(phase), 0.0, -0.08 * np.cos(phase))
+                        else: # Elbow
+                            elbow_flex = -0.45 - 0.25 * np.maximum(0.0, np.sin(phase))
+                            rot_vals[f] = euler_to_quat(elbow_flex, 0.0, 0.0)
                     tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot_vals})
 
         elif preset_name == "Run_Retargeted":
-            # Dynamic running stride
+            # Athletic running stride: high bounce, torso lean, deep knee flex & high arm pump
             root_trans = np.tile(root_orig_trans, (num_frames, 1))
-            root_trans[:, up_axis] += 0.08 * skel_height * np.abs(np.sin(2.0 * np.pi * times / duration))
+            root_trans[:, up_axis] += 0.075 * skel_height * (0.5 - 0.5 * np.cos(4.0 * np.pi * times / duration))
             tracks.append({"joint_idx": root_idx, "path": "translation", "times": times, "values": root_trans})
 
+            # Forward torso lean (~12 deg) + athletic spine twist
             for s_idx in self.classifier.spine_chain:
                 rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                 for f in range(num_frames):
                     phase = 2.0 * np.pi * times[f] / duration
-                    rot_vals[f] = euler_to_quat(0.20 + 0.06 * np.sin(phase), 0.0, 0.04 * np.cos(phase))
+                    rot_vals[f] = euler_to_quat(0.22 + 0.05 * np.sin(2*phase), 0.10 * np.sin(phase), 0.04 * np.cos(phase))
                 tracks.append({"joint_idx": s_idx, "path": "rotation", "times": times, "values": rot_vals})
 
+            # Left leg (Run stride)
             for b_idx, branch in enumerate(left_branches_sorted):
                 branch_phase_offset = 0.0 if b_idx == 0 else np.pi
                 for idx, leg_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + branch_phase_offset
-                        if idx == 0:
-                            rot_vals[f] = euler_to_quat(0.70 * np.sin(phase), 0.0, 0.0)
-                        elif idx == 1:
-                            flex = -0.55 * np.maximum(0.0, np.sin(phase))
+                        norm_phase = phase % (2.0 * np.pi)
+                        if idx == 0: # Hip (high forward swing)
+                            thigh_pitch = 0.20 + 0.65 * np.sin(norm_phase)
+                            rot_vals[f] = euler_to_quat(thigh_pitch, 0.0, 0.0)
+                        elif idx == 1: # Knee flex (deep athletic bend up to -1.35 rad / -77 deg)
+                            flex = -1.35 * (np.maximum(0.0, np.sin(norm_phase)) ** 1.2)
                             rot_vals[f] = euler_to_quat(flex, 0.0, 0.0)
+                        else: # Ankle push-off
+                            ankle_pitch = 0.32 * np.sin(norm_phase - 0.5)
+                            rot_vals[f] = euler_to_quat(ankle_pitch, 0.0, 0.0)
                     tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot_vals})
 
+            # Right leg (Run stride)
             for b_idx, branch in enumerate(right_branches_sorted):
                 branch_phase_offset = np.pi if b_idx == 0 else 0.0
                 for idx, leg_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + branch_phase_offset
-                        if idx == 0:
-                            rot_vals[f] = euler_to_quat(0.70 * np.sin(phase), 0.0, 0.0)
-                        elif idx == 1:
-                            flex = -0.55 * np.maximum(0.0, np.sin(phase))
+                        norm_phase = phase % (2.0 * np.pi)
+                        if idx == 0: # Hip
+                            thigh_pitch = 0.20 + 0.65 * np.sin(norm_phase)
+                            rot_vals[f] = euler_to_quat(thigh_pitch, 0.0, 0.0)
+                        elif idx == 1: # Knee flex
+                            flex = -1.35 * (np.maximum(0.0, np.sin(norm_phase)) ** 1.2)
                             rot_vals[f] = euler_to_quat(flex, 0.0, 0.0)
+                        else: # Ankle
+                            ankle_pitch = 0.32 * np.sin(norm_phase - 0.5)
+                            rot_vals[f] = euler_to_quat(ankle_pitch, 0.0, 0.0)
                     tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot_vals})
 
+            # Left Arm (Athletic run arm pump)
             for branch in self.classifier.left_arm_branches:
-                for arm_j in branch:
+                for idx, arm_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration + np.pi
-                        rot_vals[f] = euler_to_quat(0.55 * np.sin(phase), 0.0, 0.12 * np.cos(phase))
+                        if idx == 0: # Shoulder
+                            rot_vals[f] = euler_to_quat(0.65 * np.sin(phase), 0.0, 0.15 * np.cos(phase))
+                        else: # Elbow (bent 70 deg constantly + extra swing)
+                            elbow_flex = -1.15 - 0.35 * np.maximum(0.0, np.sin(phase))
+                            rot_vals[f] = euler_to_quat(elbow_flex, 0.0, 0.0)
                     tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot_vals})
 
+            # Right Arm (Athletic run arm pump)
             for branch in self.classifier.right_arm_branches:
-                for arm_j in branch:
+                for idx, arm_j in enumerate(branch):
                     rot_vals = np.zeros((num_frames, 4), dtype=np.float32)
                     for f in range(num_frames):
                         phase = 2.0 * np.pi * times[f] / duration
-                        rot_vals[f] = euler_to_quat(0.55 * np.sin(phase), 0.0, -0.12 * np.cos(phase))
+                        if idx == 0: # Shoulder
+                            rot_vals[f] = euler_to_quat(0.65 * np.sin(phase), 0.0, -0.15 * np.cos(phase))
+                        else: # Elbow
+                            elbow_flex = -1.15 - 0.35 * np.maximum(0.0, np.sin(phase))
+                            rot_vals[f] = euler_to_quat(elbow_flex, 0.0, 0.0)
                     tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot_vals})
 
         elif preset_name == "Dance_Retargeted":
