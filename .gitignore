@@ -57,3 +57,10 @@ htmlcov/
 .coverage.*
 coverage.xml
 *.cover
+
+# Temporary run directories & uploads
+playground/storage/
+playground/uploads/
+scratch/
+test_results/
+tmp_*/

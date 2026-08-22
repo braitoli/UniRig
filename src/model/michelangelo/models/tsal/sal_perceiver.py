@@ -25,10 +25,48 @@ import torch.nn as nn
 from typing import Optional, Union
 from einops import repeat
 import math
-from torch_cluster import fps
+try:
+    from torch_cluster import fps as _cluster_fps
+except Exception:
+    _cluster_fps = None
 import random
 import time
 import numpy as np
+
+
+def fps(xyz, batch, ratio, random_start=True):
+    """Farthest point sampling — prefers torch_cluster, falls back to pure PyTorch."""
+    if _cluster_fps is not None:
+        return _cluster_fps(xyz, batch, ratio=ratio, random_start=random_start)
+    n = xyz.shape[0]
+    n_samples = max(1, int(n * ratio))
+    device = xyz.device
+    dtype = xyz.dtype
+    out_indices = []
+    for b in batch.unique():
+        mask = (batch == b)
+        pts = xyz[mask]
+        m = pts.shape[0]
+        k = max(1, int(m * ratio))
+        if m <= k:
+            out_indices.append(torch.where(mask)[0])
+            continue
+        sel = torch.empty(k, dtype=torch.long, device=device)
+        if random_start and m > 0:
+            first = int(torch.randint(0, m, (1,)).item())
+        else:
+            first = 0
+        sel[0] = first
+        dists = torch.full((m,), float('inf'), device=device, dtype=dtype)
+        last = pts[first]
+        for i in range(1, k):
+            d = ((pts - last) ** 2).sum(dim=-1)
+            dists = torch.minimum(dists, d)
+            nxt = int(torch.argmax(dists).item())
+            sel[i] = nxt
+            last = pts[nxt]
+        out_indices.append(torch.where(mask)[0][sel])
+    return torch.cat(out_indices, dim=0)
 
 from ..modules import checkpoint
 from ..modules.embedder import FourierEmbedder

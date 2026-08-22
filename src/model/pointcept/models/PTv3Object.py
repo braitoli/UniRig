@@ -3,8 +3,16 @@ from addict import Dict
 import math
 import torch
 import torch.nn as nn
-import spconv.pytorch as spconv
-import torch_scatter
+try:
+    import spconv.pytorch as spconv
+    if spconv is None:
+        raise ImportError()
+except Exception:
+    from src.model.spconv_fallback import SpconvFallback as spconv
+try:
+    import torch_scatter
+except Exception:
+    torch_scatter = None
 from timm.models.layers import DropPath
 from typing import Union
 from einops import rearrange
@@ -92,6 +100,9 @@ class SerializedAttention(PointModule):
             self.qknorm = QueryKeyNorm(channels, num_heads)
         else:
             print("WARNING: enable_qknorm is False in PTv3Object and training may be fragile")
+        if flash_attn is None:
+            enable_flash = False
+        self.enable_flash = enable_flash
         if enable_flash:
             assert (
                 enable_rpe is False
@@ -102,7 +113,6 @@ class SerializedAttention(PointModule):
             assert (
                 upcast_softmax is False
             ), "Set upcast_softmax to False when enable Flash Attention"
-            assert flash_attn is not None, "Make sure flash_attn is installed."
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:

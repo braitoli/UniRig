@@ -1,4 +1,38 @@
-import bpy, os
+# bpy is only required for the bpy-based loaders. The Blender foundation does
+# not provide bpy wheels for ARM64 Linux, so we register a stub in sys.modules
+# that lets us `import bpy` successfully but raises a clear error if any
+# bpy.* attribute is actually accessed. Functions that only use filesystem
+# utilities (e.g. get_files) work without bpy installed.
+import sys
+import types
+import importlib.util
+
+_bpy_error = (
+    'bpy is required for this operation but is not installed. '
+    'This is expected on platforms without an official bpy wheel '
+    '(e.g. aarch64 Linux). Use the trimesh-based preprocessor instead.'
+)
+
+class _BpyStub(types.ModuleType):
+    def __init__(self):
+        super().__init__('bpy')
+        self.__file__ = '(stub)'
+        self.__path__ = []  # mark as a package
+    def __getattr__(self, name):
+        # Prevent recursive import attempts: if some code is inspecting us
+        # while we are still being defined, return a safe value.
+        if name in ('__path__', '__file__', '__name__', '__loader__',
+                    '__package__', '__spec__', '__builtins__'):
+            raise AttributeError(name)
+        raise ImportError(_bpy_error)
+
+_bpy_stub = _BpyStub()
+sys.modules['bpy'] = _bpy_stub
+# bpy submodules
+for sub in ('types', 'props', 'utils', 'ops', 'app', 'path', 'context'):
+    sys.modules[f'bpy.{sub}'] = types.ModuleType(f'bpy.{sub}')
+
+import os
 from collections import defaultdict
 from tqdm import tqdm
 import numpy as np
@@ -493,6 +527,12 @@ def get_files(
         inputs = inputs.split(',')
         for file in inputs:
             file_name = file.removeprefix("./")
+            if os.path.isabs(file_name):
+                try:
+                    file_name = os.path.relpath(file_name, os.getcwd())
+                except Exception:
+                    file_name = os.path.basename(file_name)
+            file_name = file_name.lstrip("/").removeprefix("./")
             # remove suffix
             file_name = '.'.join(file_name.split('.')[:-1])
             output_dir = os.path.join(output_dataset_dir, file_name)

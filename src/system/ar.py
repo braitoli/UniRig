@@ -340,11 +340,13 @@ class ARWriter(BasePredictionWriter):
                 path=None,
                 cls=detokenize_output.cls,
             )
-            if not self.user_mode and self.export_npz is not None:
-                print(make_path(self.export_npz, 'npz'))
-                raw_data.save(path=make_path(self.export_npz, 'npz'))
-            if not self.user_mode and self.export_obj is not None:
-                raw_data.export_skeleton(path=make_path(self.export_obj, 'obj'))
+            if self.export_npz is not None and (not self.user_mode or self.output_dir is not None):
+                raw_data.save(path=make_path(self.export_npz, 'npz', trim=(self.output_dir is not None)))
+            # Also export the .obj skeleton in user mode when an output_dir is
+            # provided (it has no bpy dependency, unlike the .fbx export). Use
+            # trim=True so the npz_dir prefix is stripped from the output path.
+            if self.export_obj is not None and (not self.user_mode or self.output_dir is not None):
+                raw_data.export_skeleton(path=make_path(self.export_obj, 'obj', trim=(self.output_dir is not None)))
             if not self.user_mode and self.export_pc is not None:
                 raw_data.export_pc(path=make_path(self.export_pc, 'obj'))
             if self.export_fbx is not None:

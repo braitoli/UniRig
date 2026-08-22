@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UniRig — 3D Skeleton, Skinning & Animation Playground</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- Three.js & Loaders -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="logo-group">
+      <div class="logo-badge">UNIRIG</div>
+      <div class="title">3D Rigging & Animation Pipeline</div>
+    </div>
+
+    <!-- LAN IP Badge -->
+    <div id="lan-pill" class="lan-pill" title="Click to copy LAN URL">
+      <div class="lan-dot"></div>
+      <span id="lan-address">Connecting...</span>
+      <i class="fa-regular fa-copy" style="font-size: 11px;"></i>
+    </div>
+
+    <div style="display: flex; gap: 10px; align-items: center;">
+      <button id="btn-refresh-jobs" class="tool-btn" title="Refresh history">
+        <i class="fa-solid fa-rotate"></i>
+      </button>
+      <div id="global-status-badge" class="status-badge running" style="display: none;">Ready</div>
+    </div>
+  </header>
+
+  <!-- App Container -->
+  <div class="app-container">
+
+    <!-- Left Sidebar: Controls & Stages -->
+    <div class="sidebar-left">
+      
+      <!-- Model Selection -->
+      <div class="panel-section">
+        <div class="section-title">
+          <span><i class="fa-solid fa-cube"></i> Chọn Model 3D</span>
+        </div>
+
+        <div class="preset-grid" id="preset-grid">
+          <button class="preset-btn" data-preset="bird">
+            <i class="fa-solid fa-dove"></i> Bird
+          </button>
+          <button class="preset-btn" data-preset="giraffe">
+            <i class="fa-solid fa-hippo"></i> Giraffe
+          </button>
+          <button class="preset-btn" data-preset="tira">
+            <i class="fa-solid fa-dragon"></i> Tira (Dino)
+          </button>
+          <button class="preset-btn" data-preset="tripo_carrot">
+            <i class="fa-solid fa-carrot"></i> Carrot
+          </button>
+        </div>
+
+        <!-- Custom Upload -->
+        <div class="upload-dropzone" id="upload-zone">
+          <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
+          <div style="font-size: 12px; font-weight: 600; color: #fff;">Kéo thả hoặc chọn file 3D</div>
+          <div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">.GLB, .OBJ, .GLTF</div>
+          <input type="file" id="file-input" accept=".glb,.gltf,.obj" style="display: none;">
+        </div>
+      </div>
+
+      <!-- Pipeline Stages Stepper -->
+      <div class="panel-section">
+        <div class="section-title">
+          <span><i class="fa-solid fa-diagram-project"></i> Tiến Trình Pipeline</span>
+        </div>
+
+        <div class="stage-stepper">
+          <!-- Step 1 -->
+          <div class="stage-step" data-step="1" id="step-card-1">
+            <div class="step-num">1</div>
+            <div class="step-info">
+              <div class="step-name">Preprocess & Normalization</div>
+              <div class="step-desc" id="step-1-desc">Mesh vertices, faces, normals</div>
+            </div>
+            <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="stage-step" data-step="2" id="step-card-2">
+            <div class="step-num">2</div>
+            <div class="step-info">
+              <div class="step-name">Skeleton Prediction</div>
+              <div class="step-desc" id="step-2-desc">UniRig AR 350M transformer</div>
+            </div>
+            <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
+          </div>
+
+          <!-- Step 3 -->
+          <div class="stage-step" data-step="3" id="step-card-3">
+            <div class="step-num">3</div>
+            <div class="step-info">
+              <div class="step-name">Skin Weights & Heatmap</div>
+              <div class="step-desc" id="step-3-desc">Bone-segment proximity & diffusion</div>
+            </div>
+            <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
+          </div>
+
+          <!-- Step 4 -->
+          <div class="stage-step" data-step="4" id="step-card-4">
+            <div class="step-num">4</div>
+            <div class="step-info">
+              <div class="step-name">Rigged GLB & Animation</div>
+              <div class="step-desc" id="step-4-desc">Idle, Walk, Run, Wave, Dance</div>
+            </div>
+            <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
+          </div>
+        </div>
+
+        <div style="margin-top: 14px; display: flex; gap: 8px;">
+          <button id="btn-run-pipeline" class="btn-primary" style="flex: 1;">
+            <i class="fa-solid fa-bolt"></i> Chạy Full Pipeline
+          </button>
+          <button id="btn-reanimate-fast" class="btn-secondary" style="flex: 1; background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); font-size: 11px; padding: 8px 10px;" title="Chạy lại ngay lập tức phần tạo chuyển động (0.1s) không cần chạy lại AI model">
+            <i class="fa-solid fa-person-running"></i> Tạo Motion (0.1s)
+          </button>
+        </div>
+      </div>
+
+      <!-- Export & Download -->
+      <div class="panel-section" id="export-section">
+        <div class="section-title">
+          <span><i class="fa-solid fa-download"></i> Tải Về Kết Quả</span>
+        </div>
+        <button id="btn-download-glb" class="btn-secondary" disabled>
+          <i class="fa-solid fa-file-arrow-down"></i> Tải Rigged & Animated .GLB
+        </button>
+        <button id="btn-download-obj" class="btn-secondary" disabled>
+          <i class="fa-solid fa-bone"></i> Tải Skeleton .OBJ
+        </button>
+      </div>
+
+    </div>
+
+    <!-- Center: 3D Viewport -->
+    <div class="viewport-container">
+      
+      <!-- Top Viewport Navigation -->
+      <div class="viewport-nav">
+        <!-- Stage Tabs -->
+        <div class="stage-tabs">
+          <button class="stage-tab active" data-tab="1">1. Mesh Thô</button>
+          <button class="stage-tab" data-tab="2">2. Skeleton</button>
+          <button class="stage-tab" data-tab="3">3. Skin Heatmap</button>
+          <button class="stage-tab" data-tab="4">4. Animation 3D</button>
+        </div>
+
+        <!-- Viewport Helpers -->
+        <div class="viewport-tools">
+          <button id="btn-toggle-wireframe" class="tool-btn" title="Toggle Wireframe">
+            <i class="fa-solid fa-border-all"></i>
+          </button>
+          <button id="btn-toggle-skeleton" class="tool-btn active" title="Toggle Skeleton Overlay">
+            <i class="fa-solid fa-bone"></i>
+          </button>
+          <button id="btn-toggle-grid" class="tool-btn active" title="Toggle Floor Grid">
+            <i class="fa-solid fa-table-cells"></i>
+          </button>
+          <button id="btn-reset-cam" class="tool-btn" title="Reset Camera">
+            <i class="fa-solid fa-crosshairs"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- 3D Canvas -->
+      <div id="canvas-wrapper" style="width: 100%; height: 100%;"></div>
+
+      <!-- Animation Playback Floating Bar (Stage 4) -->
+      <div class="anim-bar" id="anim-bar" style="display: none;">
+        <button id="btn-anim-play" class="anim-play-btn">
+          <i class="fa-solid fa-pause"></i>
+        </button>
+
+        <select id="anim-select" class="anim-select">
+          <option value="Idle">Idle (Thở nhẹ)</option>
+          <option value="Walk">Walk (Đi bộ)</option>
+          <option value="Run">Run (Chạy nhanh)</option>
+          <option value="Wave">Wave (Vẫy tay/chào)</option>
+          <option value="Dance">Dance (Nhảy múa)</option>
+        </select>
+
+        <div style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted);">
+          <span>Tốc độ:</span>
+          <input type="range" id="anim-speed" class="speed-slider" min="0.25" max="2.0" step="0.25" value="1.0">
+          <span id="speed-label">1.0x</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Right Sidebar: Inspector & History -->
+    <div class="sidebar-right">
+
+      <!-- Heatmap / Bone Selection (Visible when in stage 2 or 3) -->
+      <div class="panel-section" id="bone-inspect-section">
+        <div class="section-title">
+          <span><i class="fa-solid fa-sitemap"></i> Cây Xương (Bone Hierarchy)</span>
+          <span id="bone-count-badge" style="font-size: 11px; color: var(--accent-cyan);">0 Bones</span>
+        </div>
+
+        <!-- Heatmap legend -->
+        <div id="heatmap-legend" style="display: none; margin-bottom: 10px;">
+          <div style="font-size: 11px; color: var(--text-muted);">Weight Influence:</div>
+          <div class="heatmap-bar"></div>
+          <div class="heatmap-labels">
+            <span>0.0 (Min)</span>
+            <span>0.5</span>
+            <span>1.0 (Max)</span>
+          </div>
+        </div>
+
+        <div class="tree-view" id="bone-tree">
+          <div style="color: var(--text-muted); text-align: center; padding: 20px 0;">
+            Chưa có skeleton. Hãy chọn model và chạy pipeline.
+          </div>
+        </div>
+      </div>
+
+      <!-- History Section (Save state & Resume) -->
+      <div class="panel-section" style="flex: 1; display: flex; flex-direction: column;">
+        <div class="section-title">
+          <span><i class="fa-solid fa-clock-rotate-left"></i> Lịch Sử Đã Gen (F5 Lưu)</span>
+        </div>
+
+        <div id="history-list" style="flex: 1; overflow-y: auto;">
+          <div style="color: var(--text-muted); font-size: 12px; text-align: center; padding: 20px 0;">
+            Đang tải lịch sử...
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

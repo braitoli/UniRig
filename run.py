@@ -4,6 +4,16 @@ from box import Box
 import os
 import torch
 import lightning as L
+if hasattr(torch.serialization, 'add_safe_globals'):
+    try:
+        torch.serialization.add_safe_globals([Box])
+    except Exception:
+        pass
+_orig_torch_load = torch.load
+def _safe_torch_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _safe_torch_load
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from lightning.pytorch.loggers import WandbLogger
 from typing import List

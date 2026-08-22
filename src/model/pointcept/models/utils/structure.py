@@ -1,5 +1,10 @@
 import torch
-import spconv.pytorch as spconv
+try:
+    import spconv.pytorch as spconv
+    if spconv is None:
+        raise ImportError()
+except Exception:
+    from src.model.spconv_fallback import SpconvFallback as spconv
 
 try:
     import ocnn
@@ -9,7 +14,10 @@ from addict import Dict
 
 from .serialization import encode, decode
 from ..utils import offset2batch, batch2offset
-import torch_scatter
+try:
+    import torch_scatter
+except Exception:
+    torch_scatter = None
 
 class Point(Dict):
     """

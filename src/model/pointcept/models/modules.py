@@ -1,6 +1,11 @@
 import sys
 import torch.nn as nn
-import spconv.pytorch as spconv
+try:
+    import spconv.pytorch as spconv
+    if spconv is None:
+        raise ImportError()
+except Exception:
+    from src.model.spconv_fallback import SpconvFallback as spconv
 from collections import OrderedDict
 from .utils.structure import Point
 

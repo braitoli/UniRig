@@ -6,8 +6,14 @@ from torch.nn.functional import pad
 from typing import Dict, List
 from transformers import AutoModelForCausalLM, AutoConfig
 import math
-import torch_scatter
-from flash_attn.modules.mha import MHA
+try:
+    import torch_scatter
+except Exception:
+    torch_scatter = None
+try:
+    from flash_attn.modules.mha import MHA
+except Exception:
+    MHA = None
 
 from .spec import ModelSpec, ModelInput
 from .parse_encoder import MAP_MESH_ENCODER, get_mesh_encoder
@@ -107,6 +113,31 @@ class FrequencyPositionalEmbedding(nn.Module):
         else:
             return x
 
+class PyTorchMHA(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, cross_attn: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        self.Wq = nn.Linear(embed_dim, embed_dim)
+        self.Wkv = nn.Linear(embed_dim, 2 * embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, q, x_kv=None):
+        if x_kv is None:
+            x_kv = q
+        B, Nq, C = q.shape
+        _, Nkv, _ = x_kv.shape
+
+        q_proj = self.Wq(q).view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.Wkv(x_kv).view(B, Nkv, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k_proj, v_proj = kv[0], kv[1]
+
+        attn = F.scaled_dot_product_attention(q_proj, k_proj, v_proj)
+        attn = attn.transpose(1, 2).reshape(B, Nq, C)
+        return self.out_proj(attn)
+
 class ResidualCrossAttn(nn.Module):
     def __init__(self, feat_dim: int, num_heads: int):
         super().__init__()
@@ -114,8 +145,10 @@ class ResidualCrossAttn(nn.Module):
 
         self.norm1 = nn.LayerNorm(feat_dim)
         self.norm2 = nn.LayerNorm(feat_dim)
-        # self.attention = nn.MultiheadAttention(embed_dim=feat_dim, num_heads=num_heads, batch_first=True)
-        self.attention = MHA(embed_dim=feat_dim, num_heads=num_heads, cross_attn=True)
+        if MHA is not None:
+            self.attention = MHA(embed_dim=feat_dim, num_heads=num_heads, cross_attn=True)
+        else:
+            self.attention = PyTorchMHA(embed_dim=feat_dim, num_heads=num_heads, cross_attn=True)
         self.ffn = nn.Sequential(
             nn.Linear(feat_dim, feat_dim * 4),
             nn.GELU(),
