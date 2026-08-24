@@ -10,18 +10,35 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from .rig_export import create_rigged_glb
 from .skinning import predict_skin_weights
-from .animation import generate_standard_animations
+from .animation import generate_standard_animations, SkeletonClassifier, assign_anatomical_names
 from .pan_retargeting import generate_pan_retargeted_animations
+from .trellis_generator import TrellisImageTo3DGenerator
+from .hunyuan3d_generator import Hunyuan3DImageTo3DGenerator
 
 def auto_orient_and_center_mesh(
     vertices: np.ndarray,
-    faces: np.ndarray
+    faces: np.ndarray,
+    force_z_to_y_up: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, trimesh.Trimesh]:
     """
-    Centers mesh X and Z around (0, 0) and aligns feet/base at Y = 0,
-    preserving coordinate frame alignment between mesh vertices and predicted skeleton joints.
+    Auto-detects and aligns mesh coordinate orientation:
+    - If model is lying horizontally (Z-extent is larger than Y-extent, typical of Z-up models like TRELLIS),
+      rotates by -90 deg around X-axis so that character stands upright with Y = UP.
+    - Centers X and Z around (0, 0) and aligns feet/base at Y = 0.
     """
     v = vertices.copy().astype(np.float32)
+    extents = v.max(axis=0) - v.min(axis=0)  # [dx, dy, dz]
+    
+    # Auto-detect if model is oriented horizontally (Z is height instead of Y)
+    if force_z_to_y_up or (extents[2] > extents[1] * 1.15):
+        # Rotate -90 degrees around X: Y_new = Z_old, Z_new = -Y_old
+        x = v[:, 0].copy()
+        y = v[:, 1].copy()
+        z = v[:, 2].copy()
+        v[:, 0] = x
+        v[:, 1] = z
+        v[:, 2] = -y
+        
     j_min = v.min(axis=0)
     j_max = v.max(axis=0)
     
@@ -94,6 +111,33 @@ class UniRigPipeline:
         
         # Auto-orient to Y-Up, center X/Z around (0,0) and ground feet at Y=0
         vertices, vertex_normals, tm = auto_orient_and_center_mesh(raw_vertices, faces)
+        
+        # Preserve colors and visual materials from input mesh
+        colors = None
+        uvs = None
+        base_color_texture = None
+        metallic_roughness_texture = None
+        if hasattr(mesh, "visual") and mesh.visual is not None:
+            try:
+                tm.visual = mesh.visual.copy()
+                if (isinstance(mesh.visual, trimesh.visual.TextureVisuals)
+                        and mesh.visual.uv is not None):
+                    uv = np.asarray(mesh.visual.uv, dtype=np.float32)
+                    if len(uv) == len(vertices):
+                        uvs = uv
+                        base_color_texture = getattr(mesh.visual.material, "baseColorTexture", None)
+                        metallic_roughness_texture = getattr(
+                            mesh.visual.material, "metallicRoughnessTexture", None)
+                # Vertex colors only when there is no texture: glTF multiplies COLOR_0 with
+                # baseColorTexture, so keeping both would darken an already textured mesh.
+                if base_color_texture is None and hasattr(mesh.visual, "vertex_colors") \
+                        and mesh.visual.vertex_colors is not None:
+                    vc = np.array(mesh.visual.vertex_colors)
+                    if len(vc) == len(vertices):
+                        colors = vc
+            except Exception:
+                pass
+                
         face_normals = tm.face_normals.astype(np.float32)
         
         raw_data = {
@@ -109,6 +153,9 @@ class UniRigPipeline:
             "names": None,
             "matrix_local": None,
         }
+        if colors is not None:
+            raw_data["colors"] = colors
+            
         # Save raw_data.npz in target path and fallback subdirectories
         np.savez(str(npz_path), **raw_data)
         
@@ -123,8 +170,8 @@ class UniRigPipeline:
             np.savez(str(root_npz), **raw_data)
         
         norm_glb_path = out_dir / f"{stem}_input.glb"
-        tm.export(str(norm_glb_path))
-        
+        tm.export(str(norm_glb_path), extension_webp=True)
+
         return {
             "stem": stem,
             "rel_path": rel,
@@ -134,8 +181,13 @@ class UniRigPipeline:
             "num_faces": len(faces),
             "vertices": vertices,
             "faces": faces,
-            "normals": vertex_normals
+            "normals": vertex_normals,
+            "colors": colors,
+            "uvs": uvs,
+            "base_color_texture": base_color_texture,
+            "metallic_roughness_texture": metallic_roughness_texture
         }
+
 
     def predict_skeleton(
         self,
@@ -190,11 +242,15 @@ class UniRigPipeline:
         if res.returncode != 0:
             raise RuntimeError(f"Skeleton inference failed (code {res.returncode}):\n{res.stderr}\n{res.stdout}")
             
-        # Find output files
-        # Output is typically in output_dir/<input_rel_path>/skeleton.obj or predict_skeleton.npz
-        # Let's search inside output_dir
-        skel_npz_matches = list(out_dir.glob("**/predict_skeleton.npz")) + list(out_dir.glob("**/*_skeleton.npz"))
-        skel_obj_matches = list(out_dir.glob("**/skeleton.obj"))
+        # Find output files robustly via os.walk
+        skel_npz_matches = []
+        skel_obj_matches = []
+        for root, dirs, files in os.walk(str(out_dir)):
+            for f in files:
+                if f in ("predict_skeleton.npz", "skeleton.npz") or f.endswith("_skeleton.npz"):
+                    skel_npz_matches.append(Path(root) / f)
+                if f == "skeleton.obj":
+                    skel_obj_matches.append(Path(root) / f)
         
         if len(skel_npz_matches) == 0:
             raise FileNotFoundError(f"predict_skeleton.npz not found in {output_dir}")
@@ -205,7 +261,11 @@ class UniRigPipeline:
         joints = data["joints"].astype(np.float32)
         
         # Unnormalize joints from model's [-1, 1] space back into original mesh space
-        raw_matches = list(Path(npz_dir).glob("**/raw_data.npz"))
+        raw_matches = []
+        for root, dirs, files in os.walk(str(npz_dir)):
+            for f in files:
+                if f == "raw_data.npz":
+                    raw_matches.append(Path(root) / f)
         if raw_matches:
             raw_mesh = np.load(str(raw_matches[0]), allow_pickle=True)
             v = raw_mesh["vertices"]
@@ -225,11 +285,9 @@ class UniRigPipeline:
             else:
                 parents.append(int(p))
                 
-        names = data.get("names", None)
-        if names is not None:
-            names = [str(n) for n in names]
-        else:
-            names = [f"Bone_{i:03d}" for i in range(len(joints))]
+        # UniRig's predicted joint names carry no anatomical meaning (bone_0, bone_1, ...),
+        # so replace them with Mixamo-style names inferred from skeleton structure.
+        names = assign_anatomical_names(SkeletonClassifier(joints, parents))
             
         skel_obj_path = str(skel_obj_matches[0]) if len(skel_obj_matches) > 0 else None
         
@@ -317,7 +375,11 @@ class UniRigPipeline:
                 )
                 
                 if res.returncode == 0:
-                    skin_matches = list(stage3_dir.glob("**/predict_skin.npz"))
+                    skin_matches = []
+                    for root, dirs, files in os.walk(str(stage3_dir)):
+                        for f in files:
+                            if f == "predict_skin.npz":
+                                skin_matches.append(Path(root) / f)
                     if skin_matches:
                         data = np.load(str(skin_matches[0]), allow_pickle=True)
                         sampled_skin = data["skin"]  # (N_sampled, J)
@@ -391,20 +453,37 @@ class UniRigPipeline:
         skin_weights: np.ndarray,
         normals: Optional[np.ndarray] = None,
         names: Optional[List[str]] = None,
+        colors: Optional[np.ndarray] = None,
+        uvs: Optional[np.ndarray] = None,
         output_glb_path: Optional[str] = None,
-        use_pan_retargeting: bool = True
+        use_pan_retargeting: bool = True,
+        use_neural_pan: bool = False,
+        bvh_file_path: Optional[str] = None,
+        base_color_texture: Optional[Any] = None,
+        metallic_roughness_texture: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         Step 4: Generate retargeted animations and build complete rigged & animated GLB.
         """
         t0 = time.time()
-        if use_pan_retargeting:
+        if use_neural_pan:
             try:
+                from .neural_pan_adapter import generate_neural_pan_animations
+                animations = generate_neural_pan_animations(joints, parents, bvh_file_path=bvh_file_path)
+            except Exception as e:
+                print(f"[UniRigPipeline] Neural PAN retargeting fallback to Kinematic PAN: {e}")
+                from .pan_retargeting import generate_pan_retargeted_animations
+                animations = generate_pan_retargeted_animations(joints, parents)
+        elif use_pan_retargeting:
+            try:
+                from .pan_retargeting import generate_pan_retargeted_animations
                 animations = generate_pan_retargeted_animations(joints, parents)
             except Exception as e:
                 print(f"[UniRigPipeline] PAN retargeting fallback: {e}")
+                from .animation import generate_standard_animations
                 animations = generate_standard_animations(joints, parents)
         else:
+            from .animation import generate_standard_animations
             animations = generate_standard_animations(joints, parents)
         
         glb_bytes = create_rigged_glb(
@@ -414,11 +493,16 @@ class UniRigPipeline:
             parents=parents,
             skin_weights=skin_weights,
             normals=normals,
+            uvs=uvs,
+            colors=colors,
             joint_names=names,
             animations=animations,
-            output_path=output_glb_path
+            output_path=output_glb_path,
+            base_color_texture=base_color_texture,
+            metallic_roughness_texture=metallic_roughness_texture
         )
         t1 = time.time()
+
         
         return {
             "glb_path": output_glb_path,
@@ -427,32 +511,85 @@ class UniRigPipeline:
             "export_time_sec": round(t1 - t0, 2)
         }
 
+    def generate_3d_from_image(
+        self,
+        image_path: str,
+        output_dir: str,
+        seed: int = 42,
+        generator_type: str = "trellis",
+        progress_callback: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        Stage 0: Generates a 3D model (.glb) from a 2D image using TRELLIS.2-4B or Tencent Hunyuan3D-2.1.
+        """
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(image_path).stem
+        output_glb_path = str(out_dir / f"{stem}_generated_3d.glb")
+
+        gen_type = generator_type.lower().strip()
+        if gen_type in ["hunyuan3d", "hunyuan", "hunyuan3d-2.1", "hy3d"]:
+            generator = Hunyuan3DImageTo3DGenerator(model_id="tencent/Hunyuan3D-2.1")
+        else:
+            generator = TrellisImageTo3DGenerator(model_id="microsoft/TRELLIS.2-4B")
+
+        res = generator.generate_3d_mesh(
+            image_input=image_path,
+            output_glb_path=output_glb_path,
+            seed=seed,
+            progress_callback=progress_callback
+        )
+        return res
+
     def run_full_pipeline(
         self,
         input_path: str,
         job_id: str,
-        work_dir: str
+        work_dir: str,
+        generator_type: str = "trellis",
+        seed: int = 42,
+        progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
-        Runs the full 4-stage pipeline end-to-end.
+        Runs the full 5-stage pipeline end-to-end (Stage 0 if 2D image -> Stage 1..4).
         """
         job_dir = Path(work_dir) / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         
-        # Stage 1
+        ext = Path(input_path).suffix.lower()
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+        current_3d_input = input_path
+        stage0_res = None
+
+        if ext in image_exts:
+            # Stage 0: 2D Image to 3D Generation
+            gen_folder = "stage0_hunyuan3d" if "hunyuan" in generator_type.lower() else "stage0_trellis"
+            stage0_dir = job_dir / gen_folder
+            stage0_res = self.generate_3d_from_image(
+                image_path=input_path,
+                output_dir=str(stage0_dir),
+                seed=seed,
+                generator_type=generator_type,
+                progress_callback=progress_callback
+            )
+            current_3d_input = stage0_res["output_glb_path"]
+
+        
+        # Stage 1: Preprocess Mesh
         prep = self.preprocess_mesh(
-            input_path=input_path,
+            input_path=current_3d_input,
             output_dir=str(job_dir / "stage1_prep")
         )
         
-        # Stage 2
+        # Stage 2: Predict Skeleton
         skel = self.predict_skeleton(
-            input_mesh_path=input_path,
+            input_mesh_path=current_3d_input,
             npz_dir=str(job_dir / "stage1_prep"),
             output_dir=str(job_dir / "stage2_skel")
         )
         
-        # Stage 3
+        # Stage 3: Predict Skin Weights
         skin = self.predict_skin(
             vertices=prep["vertices"],
             faces=prep["faces"],
@@ -461,11 +598,11 @@ class UniRigPipeline:
             names=skel["names"],
             output_dir=str(job_dir / "stage3_skin"),
             use_neural=True,
-            input_mesh_path=input_path,
+            input_mesh_path=current_3d_input,
             skel_stage_dir=skel["skel_npz_path"]
         )
         
-        # Stage 4
+        # Stage 4: Export Rigged GLB & Animations
         rigged_glb = str(job_dir / f"{prep['stem']}_rigged_animated.glb")
         rig = self.export_rigged_and_animated(
             vertices=prep["vertices"],
@@ -475,15 +612,90 @@ class UniRigPipeline:
             skin_weights=skin["weights"],
             normals=prep["normals"],
             names=skel["names"],
-            output_glb_path=rigged_glb
+            colors=prep.get("colors"),
+            uvs=prep.get("uvs"),
+            base_color_texture=prep.get("base_color_texture"),
+            metallic_roughness_texture=prep.get("metallic_roughness_texture"),
+            output_glb_path=rigged_glb,
+            use_neural_pan=True
         )
-        
+
         return {
             "job_id": job_id,
             "input_file": str(input_path),
+            "stage0": stage0_res,
             "prep": prep,
             "skel": skel,
             "skin": skin,
             "rig": rig,
             "final_glb": rigged_glb
         }
+
+    def run_rigging_from_stage0(
+        self,
+        generated_glb_path: str,
+        job_id: str,
+        work_dir: str
+    ) -> Dict[str, Any]:
+        """
+        Runs Stage 1..4 (Rigging & Animation) starting from an already generated Stage 0 3D GLB model.
+        """
+        job_dir = Path(work_dir) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        current_3d_input = generated_glb_path
+
+        # Stage 1: Preprocess Mesh
+        prep = self.preprocess_mesh(
+            input_path=current_3d_input,
+            output_dir=str(job_dir / "stage1_prep")
+        )
+
+        # Stage 2: Predict Skeleton
+        skel = self.predict_skeleton(
+            input_mesh_path=current_3d_input,
+            npz_dir=str(job_dir / "stage1_prep"),
+            output_dir=str(job_dir / "stage2_skel")
+        )
+
+        # Stage 3: Predict Skin Weights
+        skin = self.predict_skin(
+            vertices=prep["vertices"],
+            faces=prep["faces"],
+            joints=skel["joints"],
+            parents=skel["parents"],
+            names=skel["names"],
+            output_dir=str(job_dir / "stage3_skin"),
+            use_neural=True,
+            input_mesh_path=current_3d_input,
+            skel_stage_dir=skel["skel_npz_path"]
+        )
+
+        # Stage 4: Export Rigged GLB & Animations
+        rigged_glb = str(job_dir / f"{prep['stem']}_rigged_animated.glb")
+        rig = self.export_rigged_and_animated(
+            vertices=prep["vertices"],
+            faces=prep["faces"],
+            joints=skel["joints"],
+            parents=skel["parents"],
+            skin_weights=skin["weights"],
+            normals=prep["normals"],
+            names=skel["names"],
+            colors=prep.get("colors"),
+            uvs=prep.get("uvs"),
+            base_color_texture=prep.get("base_color_texture"),
+            metallic_roughness_texture=prep.get("metallic_roughness_texture"),
+            output_glb_path=rigged_glb,
+            use_neural_pan=True
+        )
+
+        return {
+            "job_id": job_id,
+            "input_file": str(generated_glb_path),
+            "prep": prep,
+            "skel": skel,
+            "skin": skin,
+            "rig": rig,
+            "final_glb": rigged_glb
+        }
+

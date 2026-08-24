@@ -64,3 +64,6 @@ playground/uploads/
 scratch/
 test_results/
 tmp_*/
+external/
+temp_input_image.png
+tmp_*.glb

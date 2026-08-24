@@ -56,6 +56,9 @@ class RawData(Exporter):
     # data cls
     cls: Union[str, None]=None
     
+    # optional vertex colors, shape (N, 3) or (N, 4)
+    colors: Union[ndarray, None]=None
+    
     @staticmethod
     def load(path: str, origin=np.float16, to=np.float32) -> 'RawData':
         data = np.load(path, allow_pickle=True)
@@ -66,7 +69,11 @@ class RawData(Exporter):
             d['no_skin'] = ~np.any(skin>0, axis=0)
         else:
             d['no_skin'] = None
-        return RawData(**d).change_dtype(origin, to)
+        # Safely filter only dataclass fields
+        valid_fields = RawData.__dataclass_fields__.keys()
+        filtered_d = {k: v for k, v in d.items() if k in valid_fields}
+        return RawData(**filtered_d).change_dtype(origin, to)
+
     
     def change_dtype(self, origin, to) -> 'RawData':
         d = {}

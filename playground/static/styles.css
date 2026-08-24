@@ -167,6 +167,37 @@ header {
   color: var(--accent-cyan);
 }
 
+/* Generator Toggle Buttons */
+.generator-btn {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.generator-btn:hover {
+  background-color: var(--bg-card-hover);
+  border-color: var(--border-focus);
+  color: var(--text-main);
+}
+
+.generator-btn.active {
+  border-color: var(--accent-cyan);
+  background: linear-gradient(135deg, rgba(0, 242, 254, 0.15) 0%, rgba(79, 70, 229, 0.15) 100%);
+  color: var(--accent-cyan);
+  box-shadow: 0 0 12px rgba(0, 242, 254, 0.2);
+  font-weight: 700;
+}
+
 .upload-dropzone {
   border: 2px dashed var(--border-color);
   border-radius: var(--radius-md);
@@ -214,6 +245,23 @@ header {
 .stage-step.active {
   border-color: var(--accent-cyan);
   background: rgba(0, 242, 254, 0.08);
+}
+
+.stage-step.running {
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.12);
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.3);
+  animation: pulse-step 1.5s infinite alternate;
+}
+
+.stage-step.running .step-num {
+  background-color: #f59e0b;
+  color: #fff;
+}
+
+@keyframes pulse-step {
+  0% { box-shadow: 0 0 4px rgba(245, 158, 11, 0.2); }
+  100% { box-shadow: 0 0 14px rgba(245, 158, 11, 0.5); }
 }
 
 .stage-step.completed .step-num {
@@ -588,4 +636,20 @@ header {
   width: 450px;
   padding: 20px;
   box-shadow: var(--shadow-lg);
+}
+
+.tool-btn-sm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-color);
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.tool-btn-sm:hover {
+  background: rgba(255, 255, 255, 0.15);
+  transform: translateY(-1px);
 }

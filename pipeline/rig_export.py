@@ -1,8 +1,9 @@
 import numpy as np
 import struct
 import json
+import io
 import trimesh
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Any, List, Dict, Tuple, Optional, Union
 
 def build_inverse_bind_matrices(world_matrices: List[np.ndarray]) -> np.ndarray:
     """
@@ -54,9 +55,13 @@ def create_rigged_glb(
     skin_weights: np.ndarray,
     normals: Optional[np.ndarray] = None,
     uvs: Optional[np.ndarray] = None,
+    colors: Optional[np.ndarray] = None,
     joint_names: Optional[List[str]] = None,
     animations: Optional[Dict[str, Dict]] = None,
-    output_path: Optional[str] = None
+    output_path: Optional[str] = None,
+    base_color_texture: Optional[Any] = None,
+    metallic_roughness_texture: Optional[Any] = None,
+    texture_quality: int = 90
 ) -> bytes:
     """
     Creates a standard, valid binary glTF 2.0 (.glb) file with skinned mesh, bone hierarchy,
@@ -70,14 +75,25 @@ def create_rigged_glb(
         skin_weights: (N, J) float32
         normals: (N, 3) float32 (optional)
         uvs: (N, 2) float32 (optional)
+        colors: (N, 3) or (N, 4) uint8/float32 (optional vertex colors)
         joint_names: List of strings (optional)
         animations: Dict of animation name -> tracks (optional)
         output_path: filepath to save .glb
+        base_color_texture: PIL.Image baseColor atlas; embedded as WEBP via EXT_texture_webp.
+            Requires uvs. When given, vertex colors are dropped because glTF multiplies
+            COLOR_0 with baseColorTexture.
+        metallic_roughness_texture: PIL.Image metallic/roughness atlas (optional)
+        texture_quality: WEBP encoder quality for the embedded atlases
     """
     N = len(vertices)
     F = len(faces)
     J = len(joints)
-    
+
+    # A textured mesh must not also carry COLOR_0: glTF multiplies the two and darkens it.
+    use_texture = base_color_texture is not None and uvs is not None
+    if use_texture:
+        colors = None
+
     if joint_names is None:
         joint_names = [f"Bone_{i:03d}" for i in range(J)]
         
@@ -142,36 +158,35 @@ def create_rigged_glb(
             node_def["children"] = [1 + child_idx for child_idx in children_map[i]]
         nodes.append(node_def)
         
-    scene_nodes = [0] + [1 + r for r in root_joints]
-    
-    # Build binary buffers
-    buffer_bytes = bytearray()
+    binary_blob = bytearray()
     buffer_views = []
     accessors = []
     
-    def add_buffer_data(data: np.ndarray, target: Optional[int] = None) -> int:
-        nonlocal buffer_bytes, buffer_views, accessors
-        pad = (4 - (len(buffer_bytes) % 4)) % 4
-        if pad > 0:
-            buffer_bytes.extend(b'\x00' * pad)
+    def add_buffer_data(data_bytes_or_np: Union[bytes, np.ndarray], target: Optional[int] = None) -> int:
+        nonlocal binary_blob
+        if isinstance(data_bytes_or_np, np.ndarray):
+            raw_b = data_bytes_or_np.tobytes()
+        else:
+            raw_b = data_bytes_or_np
             
-        byte_offset = len(buffer_bytes)
-        raw = data.tobytes()
-        byte_length = len(raw)
-        buffer_bytes.extend(raw)
+        pad = (4 - (len(binary_blob) % 4)) % 4
+        binary_blob.extend(b"\x00" * pad)
+        offset = len(binary_blob)
+        length = len(raw_b)
+        binary_blob.extend(raw_b)
         
         bv_idx = len(buffer_views)
-        bv_def = {
+        bv_dict = {
             "buffer": 0,
-            "byteOffset": byte_offset,
-            "byteLength": byte_length,
+            "byteOffset": offset,
+            "byteLength": length
         }
         if target is not None:
-            bv_def["target"] = target
-        buffer_views.append(bv_def)
+            bv_dict["target"] = target
+        buffer_views.append(bv_dict)
         return bv_idx
     
-    # 1. Position buffer (float32 x 3)
+    # 1. POSITION buffer (float32 x 3)
     pos_data = vertices.astype(np.float32)
     pos_bv = add_buffer_data(pos_data, 34962)
     pos_acc = len(accessors)
@@ -181,12 +196,21 @@ def create_rigged_glb(
         "componentType": 5126, # FLOAT
         "count": N,
         "type": "VEC3",
-        "min": [float(x) for x in pos_data.min(axis=0)],
-        "max": [float(x) for x in pos_data.max(axis=0)]
+        "min": [float(pos_data[:, 0].min()), float(pos_data[:, 1].min()), float(pos_data[:, 2].min())],
+        "max": [float(pos_data[:, 0].max()), float(pos_data[:, 1].max()), float(pos_data[:, 2].max())]
     })
     
-    # 2. Normal buffer (float32 x 3)
-    norm_data = normals.astype(np.float32)
+    # 2. NORMAL buffer (float32 x 3)
+    # glTF requires unit-length normals. Zero-area triangles in the source mesh (duplicate
+    # positions kept apart only by their UVs) produce zero-length vertex normals, so
+    # substitute a valid axis for those and renormalize the rest.
+    norm_data = np.asarray(normals, dtype=np.float32).copy()
+    norm_lengths = np.linalg.norm(norm_data, axis=1)
+    degenerate = norm_lengths < 1e-6
+    if degenerate.any():
+        norm_data[degenerate] = (0.0, 1.0, 0.0)
+        norm_lengths[degenerate] = 1.0
+    norm_data = (norm_data / norm_lengths[:, None]).astype(np.float32)
     norm_bv = add_buffer_data(norm_data, 34962)
     norm_acc = len(accessors)
     accessors.append({
@@ -224,7 +248,10 @@ def create_rigged_glb(
     # 5. Optional UV buffer
     uv_acc = None
     if uvs is not None:
-        uv_data = uvs.astype(np.float32)
+        # UVs come from trimesh, whose origin is bottom-left; glTF TEXCOORD_0 is top-left.
+        # Without flipping V every atlas chart samples the wrong texels and the texture smears.
+        uv_data = np.asarray(uvs, dtype=np.float32).copy()
+        uv_data[:, 1] = 1.0 - uv_data[:, 1]
         uv_bv = add_buffer_data(uv_data, 34962)
         uv_acc = len(accessors)
         accessors.append({
@@ -233,6 +260,29 @@ def create_rigged_glb(
             "componentType": 5126,
             "count": N,
             "type": "VEC2"
+        })
+
+    # 5.5 Optional COLOR_0 buffer (vertex colors)
+    col_acc = None
+    if colors is not None and len(colors) == N:
+        col_arr = np.array(colors)
+        if col_arr.dtype != np.uint8 and col_arr.max() <= 1.0:
+            col_arr = (col_arr * 255).astype(np.uint8)
+        else:
+            col_arr = col_arr.astype(np.uint8)
+            
+        if col_arr.shape[1] == 3:
+            col_arr = np.hstack([col_arr, np.full((len(col_arr), 1), 255, dtype=np.uint8)])
+            
+        col_bv = add_buffer_data(col_arr, 34962)
+        col_acc = len(accessors)
+        accessors.append({
+            "bufferView": col_bv,
+            "byteOffset": 0,
+            "componentType": 5121, # UNSIGNED_BYTE
+            "normalized": True,
+            "count": N,
+            "type": "VEC4"
         })
         
     # 6. Face indices
@@ -266,6 +316,36 @@ def create_rigged_glb(
         "type": "MAT4"
     })
     
+    # 8. PBR atlases, embedded as WEBP (EXT_texture_webp) exactly like TRELLIS exports them
+    images = []
+    textures = []
+    materials = []
+    if use_texture:
+        def add_webp_image(pil_img) -> int:
+            buf = io.BytesIO()
+            pil_img.save(buf, "WEBP", quality=texture_quality)
+            bv = add_buffer_data(buf.getvalue())  # image bufferViews must carry no target
+            images.append({"bufferView": bv, "mimeType": "image/webp"})
+            textures.append({"extensions": {"EXT_texture_webp": {"source": len(images) - 1}}})
+            return len(textures) - 1
+
+        pbr = {
+            "baseColorTexture": {"index": add_webp_image(base_color_texture)},
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "roughnessFactor": 1.0,
+        }
+        if metallic_roughness_texture is not None:
+            pbr["metallicFactor"] = 1.0
+            pbr["metallicRoughnessTexture"] = {"index": add_webp_image(metallic_roughness_texture)}
+        else:
+            # glTF defaults metallicFactor to 1.0, which would render the model as bare metal.
+            pbr["metallicFactor"] = 0.0
+        materials.append({
+            "pbrMetallicRoughness": pbr,
+            "alphaMode": "OPAQUE",
+            "doubleSided": False
+        })
+
     attributes = {
         "POSITION": pos_acc,
         "NORMAL": norm_acc,
@@ -274,14 +354,20 @@ def create_rigged_glb(
     }
     if uv_acc is not None:
         attributes["TEXCOORD_0"] = uv_acc
-        
+    if col_acc is not None:
+        attributes["COLOR_0"] = col_acc
+
+    primitive = {
+        "attributes": attributes,
+        "indices": face_acc,
+        "mode": 4 # TRIANGLES
+    }
+    if materials:
+        primitive["material"] = 0
+
     meshes = [{
         "name": "SkinnedMesh",
-        "primitives": [{
-            "attributes": attributes,
-            "indices": face_acc,
-            "mode": 4 # TRIANGLES
-        }]
+        "primitives": [primitive]
     }]
     
     skins = [{
@@ -348,6 +434,8 @@ def create_rigged_glb(
                 "samplers": samplers
             })
             
+    scene_nodes = [0] + [1 + r for r in root_joints]
+    
     gltf_dict = {
         "asset": {
             "version": "2.0",
@@ -363,31 +451,39 @@ def create_rigged_glb(
         "accessors": accessors,
         "bufferViews": buffer_views,
         "buffers": [{
-            "byteLength": len(buffer_bytes)
+            "byteLength": len(binary_blob)
         }]
     }
     if len(gltf_animations) > 0:
         gltf_dict["animations"] = gltf_animations
-        
+
+    if materials:
+        gltf_dict["materials"] = materials
+        gltf_dict["textures"] = textures
+        gltf_dict["images"] = images
+        gltf_dict["extensionsUsed"] = ["EXT_texture_webp"]
+        gltf_dict["extensionsRequired"] = ["EXT_texture_webp"]
+
     json_bytes = json.dumps(gltf_dict, separators=(',', ':')).encode('utf-8')
     json_pad = (4 - (len(json_bytes) % 4)) % 4
     if json_pad > 0:
         json_bytes += b' ' * json_pad
         
-    bin_pad = (4 - (len(buffer_bytes) % 4)) % 4
+    bin_pad = (4 - (len(binary_blob) % 4)) % 4
     if bin_pad > 0:
-        buffer_bytes.extend(b'\x00' * bin_pad)
+        binary_blob.extend(b'\x00' * bin_pad)
         
-    total_length = 12 + 8 + len(json_bytes) + 8 + len(buffer_bytes)
+    total_length = 12 + 8 + len(json_bytes) + 8 + len(binary_blob)
     
     header = struct.pack('<4sII', b'glTF', 2, total_length)
     chunk0_header = struct.pack('<I4s', len(json_bytes), b'JSON')
-    chunk1_header = struct.pack('<I4s', len(buffer_bytes), b'BIN\x00')
+    chunk1_header = struct.pack('<I4s', len(binary_blob), b'BIN\x00')
     
-    glb_content = header + chunk0_header + json_bytes + chunk1_header + bytes(buffer_bytes)
+    glb_content = header + chunk0_header + json_bytes + chunk1_header + bytes(binary_blob)
     
     if output_path:
         with open(output_path, 'wb') as f:
             f.write(glb_content)
+
             
     return glb_content

@@ -5,7 +5,7 @@
 > - **Stage 1 (Preprocess):** Chuẩn hóa mesh bằng `trimesh`
 > - **Stage 2 (Skeleton):** UniRig AR 350M transformer (`sdpa` attention)
 > - **Stage 3 (Skin Weights):** Bone-segment proximity weighting kết hợp surface Laplacian graph diffusion
-> - **Stage 4 (Rigged GLB & Animation):** Xuất file standard glTF 2.0 / GLB có skins, joints, IBM, weights và 5 motion clip (`Idle`, `Walk`, `Run`, `Wave`, `Dance`)
+> - **Stage 4 (Rigged GLB & Animation):** Xuất file standard glTF 2.0 / GLB có skins, joints, IBM, weights và 5 motion clip (`Idle`, `Walk`, `Run`, `Wave`, `Dance`), hỗ trợ cả Kinematic Procedural và **Deep Learning Neural PAN Retargeting (`hlcdyy/pan-motion-retargeting`)** từ dữ liệu Mocap thực tế.
 > - **Web Playground (Three.js):** Giao diện tương tác 3D đa giai đoạn, hiển thị heatmap da theo từng khớp xương, mixer điều khiển animation, lưu trạng thái tự động resume khi F5, xem lịch sử và publish ra mạng LAN.
 
 ---

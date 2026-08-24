@@ -35,8 +35,9 @@ function init3D() {
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setSize(width, height);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.2;
+  renderer.toneMappingExposure = 1.1;
   container.appendChild(renderer.domElement);
 
   controls = new THREE.OrbitControls(camera, renderer.domElement);
@@ -44,21 +45,25 @@ function init3D() {
   controls.dampingFactor = 0.05;
   controls.target.set(0, 0.5, 0);
 
-  // Lighting
-  const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+  // Studio PBR Multi-directional Lighting
+  const ambient = new THREE.AmbientLight(0xffffff, 0.7);
   scene.add(ambient);
 
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 0.6);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x334466, 0.8);
   hemi.position.set(0, 10, 0);
   scene.add(hemi);
 
-  const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
-  dirLight1.position.set(5, 10, 7);
-  scene.add(dirLight1);
+  const keyLight = new THREE.DirectionalLight(0xfff8f0, 1.3);
+  keyLight.position.set(5, 8, 6);
+  scene.add(keyLight);
 
-  const dirLight2 = new THREE.DirectionalLight(0x00d2ff, 0.6);
-  dirLight2.position.set(-5, -5, -5);
-  scene.add(dirLight2);
+  const fillLight = new THREE.DirectionalLight(0x88ccff, 0.8);
+  fillLight.position.set(-6, 4, -5);
+  scene.add(fillLight);
+
+  const rimLight = new THREE.DirectionalLight(0xffffff, 0.5);
+  rimLight.position.set(0, -6, -4);
+  scene.add(rimLight);
 
   // Grid
   const grid = new THREE.GridHelper(10, 20, 0x00f2fe, 0x233150);
@@ -83,9 +88,6 @@ function animate() {
   const delta = clock.getDelta();
   if (currentMixer && isPlaying) {
     currentMixer.update(delta);
-  }
-  if (animSkeletonHelper) {
-    animSkeletonHelper.update();
   }
   controls.update();
   renderer.render(scene, camera);
@@ -172,18 +174,28 @@ async function loadHistory() {
 
     container.innerHTML = jobs.map(j => {
       const isSel = j.id === activeJobId ? 'active' : '';
-      const stClass = j.status === 'completed' ? 'completed' : (j.status === 'failed' ? 'failed' : 'running');
+      const stClass = j.status === 'completed' ? 'completed' : (j.status === 'completed_3d_only' ? 'completed' : (j.status === 'failed' ? 'failed' : 'running'));
+      const statusLabel = j.status === 'completed_3d_only' ? '3D Ready' : j.status;
       const timeStr = new Date(j.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const hasRiggedGlb = j.status === 'completed';
+      const has3DGlb = j.status === 'completed' || j.status === 'completed_3d_only' || j.stage >= 0;
+
       return `
         <div class="history-item ${isSel}" data-job-id="${j.id}">
           <div class="history-header">
             <div class="history-title">${j.title}</div>
-            <span class="status-badge ${stClass}">${j.status}</span>
+            <span class="status-badge ${stClass}">${statusLabel}</span>
           </div>
-          <div class="history-meta">
-            <span><i class="fa-regular fa-clock"></i> ${timeStr}</span>
-            <span><i class="fa-solid fa-bone"></i> ${j.num_bones} bones</span>
-            <span><i class="fa-solid fa-stopwatch"></i> ${j.duration_sec ? j.duration_sec + 's' : '--'}</span>
+          <div class="history-meta" style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; gap: 8px;">
+              <span><i class="fa-regular fa-clock"></i> ${timeStr}</span>
+              <span><i class="fa-solid fa-bone"></i> ${j.num_bones} bones</span>
+              <span><i class="fa-solid fa-stopwatch"></i> ${j.duration_sec ? j.duration_sec + 's' : '--'}</span>
+            </div>
+            <div style="display: flex; gap: 4px;">
+              ${has3DGlb ? `<a href="/api/jobs/${j.id}/files/generated_3d_glb" target="_blank" class="tool-btn-sm" style="color: var(--accent-cyan); font-size: 11px; padding: 2px 5px; text-decoration: none;" title="Tải Model 3D .GLB" onclick="event.stopPropagation()"><i class="fa-solid fa-cube"></i></a>` : ''}
+              ${hasRiggedGlb ? `<a href="/api/jobs/${j.id}/files/rigged_glb" target="_blank" class="tool-btn-sm" style="color: var(--accent-emerald); font-size: 11px; padding: 2px 5px; text-decoration: none;" title="Tải Rigged Animated .GLB" onclick="event.stopPropagation()"><i class="fa-solid fa-file-arrow-down"></i></a>` : ''}
+            </div>
           </div>
         </div>
       `;
@@ -215,10 +227,25 @@ async function selectJob(jobId) {
   await fetchAndRenderJob(jobId);
 }
 
+let smoothProgressVal = 0;
+let progressInterpolationTimer = null;
+
+function applyProgressUI(pct) {
+  const overlayPct = document.getElementById('overlay-progress-pct');
+  const overlayBar = document.getElementById('overlay-progress-bar');
+  const step0Badge = document.getElementById('step-0-badge');
+
+  if (overlayPct) overlayPct.textContent = `${pct}%`;
+  if (overlayBar) overlayBar.style.width = `${Math.max(5, Math.min(100, pct))}%`;
+  if (step0Badge && currentJobData && currentJobData.status === 'processing_image_to_3d') {
+    step0Badge.textContent = `${pct}%`;
+  }
+}
+
 // Fetch single job status & render appropriate stage
 async function fetchAndRenderJob(jobId) {
   try {
-    const res = await fetch(`/api/jobs/${jobId}`);
+    const res = await fetch(`/api/jobs/${jobId}?_t=${Date.now()}`);
     if (!res.ok) throw new Error("Job not found");
     const job = await res.json();
     currentJobData = job;
@@ -230,8 +257,9 @@ async function fetchAndRenderJob(jobId) {
       startPolling(jobId);
     } else {
       stopPolling();
-      // Load 3D model for current stage tab
-      load3DForStage(currentStage);
+      // Load 3D model (default to stage 4 Animation if completed, or stage 0 if completed_3d_only)
+      const stageToLoad = job.status === 'completed' ? 4 : (job.status === 'completed_3d_only' ? 0 : currentStage);
+      load3DForStage(stageToLoad);
     }
   } catch (e) {
     console.error("Error fetching job", e);
@@ -240,25 +268,59 @@ async function fetchAndRenderJob(jobId) {
 
 function startPolling(jobId) {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    const res = await fetch(`/api/jobs/${jobId}`);
-    if (res.ok) {
-      const job = await res.json();
-      currentJobData = job;
-      updateUIWithJob(job);
-      if (job.status === 'completed' || job.status === 'failed') {
-        stopPolling();
-        loadHistory();
-        load3DForStage(currentStage);
+  if (progressInterpolationTimer) clearInterval(progressInterpolationTimer);
+
+  // Micro-tick animation to keep progress bar smoothly interpolating to backend target
+  progressInterpolationTimer = setInterval(() => {
+    if (!currentJobData) return;
+    const st = currentJobData.status;
+    if (st.startsWith('processing') || st === 'queued') {
+      const targetPct = currentJobData.metadata?.progress?.pct || 10;
+      if (smoothProgressVal < targetPct) {
+        smoothProgressVal += (targetPct - smoothProgressVal) * 0.35 + 0.2;
+        if (smoothProgressVal >= targetPct) smoothProgressVal = targetPct;
+        applyProgressUI(Math.round(smoothProgressVal));
+      } else {
+        applyProgressUI(Math.round(smoothProgressVal));
       }
     }
-  }, 1500);
+  }, 100);
+
+  const doPoll = async () => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}?_t=${Date.now()}`);
+      if (res.ok) {
+        const job = await res.json();
+        currentJobData = job;
+        updateUIWithJob(job);
+        
+        if (job.status === 'completed' || job.status === 'completed_3d_only' || job.status === 'failed') {
+          stopPolling();
+          smoothProgressVal = 100;
+          applyProgressUI(100);
+          loadHistory();
+          const stageToLoad = job.status === 'completed' ? 4 : (job.status === 'completed_3d_only' ? 0 : currentStage);
+          load3DForStage(stageToLoad);
+        }
+      }
+    } catch (e) {
+      console.warn("Polling error:", e);
+    }
+  };
+
+  doPoll();
+  pollTimer = setInterval(doPoll, 400);
 }
+
 
 function stopPolling() {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (progressInterpolationTimer) {
+    clearInterval(progressInterpolationTimer);
+    progressInterpolationTimer = null;
   }
 }
 
@@ -266,26 +328,161 @@ function stopPolling() {
 function updateUIWithJob(job) {
   const badge = document.getElementById('global-status-badge');
   badge.style.display = 'block';
-  badge.textContent = job.status;
-  badge.className = `status-badge ${job.status === 'completed' ? 'completed' : (job.status === 'failed' ? 'failed' : 'running')}`;
+  badge.textContent = job.status === 'completed_3d_only' ? '3D Model Ready' : job.status;
+  badge.className = `status-badge ${job.status.includes('completed') ? 'completed' : (job.status === 'failed' ? 'failed' : 'running')}`;
+
+  // Check if input is a 2D image
+  const ext = job.input_filename ? job.input_filename.split('.').pop().toLowerCase() : '';
+  const isImageInput = ['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext) || !!job.metadata?.stage0;
+  
+  const step0Card = document.getElementById('step-card-0');
+  const step0Desc = document.getElementById('step-0-desc');
+  const imgPreviewCard = document.getElementById('image-preview-card');
+  const imgPreviewElem = document.getElementById('image-preview-img');
+
+  const genName = (job.metadata?.generator === 'trellis' || job.metadata?.stage0?.model_used?.includes('TRELLIS')) ? 'TRELLIS.2-4B' : 'Tencent Hunyuan3D-2.1';
+
+  // Progress info from metadata
+  const progress = job.metadata?.progress || {};
+  const currentPct = progress.pct !== undefined ? progress.pct : (job.status === 'completed' || job.status === 'completed_3d_only' ? 100 : (job.status === 'queued' ? 5 : 20));
+  const currentStepName = progress.step_name || (job.status === 'processing_image_to_3d' ? `Đang tạo 3D bằng ${genName}...` : `Giai đoạn ${job.stage}/4: ${job.status.replace('processing_', '')}...`);
+  const stepIdx = progress.step_idx || (job.stage || 1);
+  const totalSteps = progress.total_steps || (job.status === 'processing_image_to_3d' ? 5 : 4);
+
+  if (job.status === 'completed' || job.status === 'completed_3d_only') {
+    smoothProgressVal = 100;
+  } else if (smoothProgressVal < currentPct) {
+    smoothProgressVal = currentPct;
+  }
+
+  const step0Badge = document.getElementById('step-0-badge');
+  if (isImageInput) {
+    if (step0Card) step0Card.style.display = 'flex';
+    if (step0Desc) step0Desc.textContent = `${genName} Model`;
+    if (step0Badge) {
+      step0Badge.style.display = 'inline-block';
+      if (job.status === 'processing_image_to_3d') {
+        step0Badge.textContent = `${Math.round(smoothProgressVal)}%`;
+        step0Badge.className = 'status-badge running';
+      } else if (job.stage >= 1 || job.status === 'completed_3d_only' || job.status === 'completed') {
+        step0Badge.textContent = '100%';
+        step0Badge.className = 'status-badge completed';
+      } else {
+        step0Badge.textContent = '0%';
+        step0Badge.className = 'status-badge running';
+      }
+    }
+    if (imgPreviewCard && imgPreviewElem) {
+      imgPreviewCard.style.display = 'block';
+      imgPreviewElem.src = `/api/jobs/${job.id}/files/input_image`;
+    }
+  } else {
+    if (step0Card) step0Card.style.display = 'none';
+    if (imgPreviewCard) imgPreviewCard.style.display = 'none';
+  }
+
+  // Viewport Overlays Handling
+  const overlay = document.getElementById('viewport-processing-overlay');
+  const overlayTitle = document.getElementById('overlay-title');
+  const overlayStepBadge = document.getElementById('overlay-step-badge');
+  const overlayPct = document.getElementById('overlay-progress-pct');
+  const overlayBar = document.getElementById('overlay-progress-bar');
+  const overlayDescText = document.getElementById('overlay-desc-text');
+  const bannerCompleted = document.getElementById('viewport-completed-banner');
+  const bannerTitle = document.getElementById('banner-completed-title');
+
+  if (job.status.startsWith('processing') || job.status === 'queued') {
+    if (overlay) overlay.style.display = 'block';
+    if (bannerCompleted) bannerCompleted.style.display = 'none';
+
+    if (job.status === 'processing_image_to_3d' || job.status === 'queued') {
+      if (overlayTitle) overlayTitle.textContent = "✨ Đang tạo Model 3D từ Ảnh 2D...";
+    } else {
+      if (overlayTitle) overlayTitle.textContent = "🦴 Đang xử lý Rigging & Motion 3D...";
+    }
+
+    if (overlayStepBadge) overlayStepBadge.textContent = `Bước ${stepIdx}/${totalSteps}`;
+    applyProgressUI(Math.round(smoothProgressVal));
+    if (overlayDescText) overlayDescText.textContent = currentStepName;
+
+  } else {
+    if (overlay) overlay.style.display = 'none';
+    if (job.status === 'completed_3d_only' && bannerCompleted) {
+      if (bannerTitle) {
+        bannerTitle.innerHTML = `<i class="fa-solid fa-circle-check"></i> Đã tạo xong Model 3D từ Ảnh 2D (${genName})!`;
+      }
+      bannerCompleted.style.display = 'block';
+    } else if (bannerCompleted) {
+      bannerCompleted.style.display = 'none';
+    }
+  }
+
+
 
   // Update stepper cards
-  for (let s = 1; s <= 4; s++) {
+  const stageMap = {
+    'processing_image_to_3d': 0,
+    'processing_prep': 1,
+    'processing_skeleton': 2,
+    'processing_skin': 3,
+    'processing_rig': 4
+  };
+  const activeStep = stageMap[job.status];
+
+  for (let s = 0; s <= 4; s++) {
     const card = document.getElementById(`step-card-${s}`);
+    if (!card) continue;
     const check = card.querySelector('.step-check');
-    if (job.stage >= s) {
+    
+    // Clear old state classes
+    card.classList.remove('completed', 'running');
+
+    if (s === activeStep) {
+      card.classList.add('running');
+      if (check) check.style.display = 'none';
+    } else if (job.stage > s || (job.status === 'completed_3d_only' && s === 0) || (job.status === 'completed' && s <= 4)) {
       card.classList.add('completed');
       if (check) check.style.display = 'inline-block';
     } else {
-      card.classList.remove('completed');
       if (check) check.style.display = 'none';
     }
   }
 
   // Update buttons
   const isDone = job.status === 'completed';
-  document.getElementById('btn-download-glb').disabled = !isDone;
-  document.getElementById('btn-download-obj').disabled = job.stage < 2;
+  const is3DModelAvailable = job.status === 'completed' || job.status === 'completed_3d_only' || job.stage >= 1 || !!job.metadata?.stage0 || !!job.metadata?.prep;
+  
+  // Download buttons
+  const btn3d = document.getElementById('btn-download-3d-stage0');
+  if (btn3d) {
+    btn3d.disabled = !is3DModelAvailable;
+  }
+
+  const btnPreview3d = document.getElementById('btn-preview-download-3d');
+  if (btnPreview3d) {
+    btnPreview3d.disabled = !is3DModelAvailable;
+    btnPreview3d.style.opacity = is3DModelAvailable ? '1' : '0.5';
+  }
+
+  const btnGlb = document.getElementById('btn-download-glb');
+  if (btnGlb) {
+    btnGlb.disabled = !isDone;
+  }
+
+  const btnObj = document.getElementById('btn-download-obj');
+  if (btnObj) {
+    btnObj.disabled = job.stage < 2;
+  }
+
+  const btnContinue = document.getElementById('btn-continue-rigging');
+  if (btnContinue) {
+    if (job.status === 'completed_3d_only' || (job.stage === 0 && !job.status.startsWith('processing'))) {
+      btnContinue.style.display = 'block';
+      btnContinue.disabled = false;
+    } else {
+      btnContinue.style.display = 'none';
+    }
+  }
 
   // Update Bone Tree
   const skelMeta = job.metadata?.skel;
@@ -331,7 +528,7 @@ async function load3DForStage(stage) {
 
   const loader = new THREE.GLTFLoader();
 
-  if (stage === 1 || stage === 2 || stage === 3) {
+  if (stage === 0 || stage === 1 || stage === 2 || stage === 3) {
     // Load Input Normalized GLB
     const url = `/api/jobs/${currentJobData.id}/files/input_model`;
     loader.load(url, (gltf) => {
@@ -344,13 +541,33 @@ async function load3DForStage(stage) {
         if (child.isMesh) {
           child.castShadow = true;
           child.receiveShadow = true;
-          if (stage === 1) {
-            child.material = new THREE.MeshStandardMaterial({
-              color: 0xcccccc,
-              roughness: 0.4,
-              metalness: 0.1,
-              wireframe: wireframeMode
-            });
+          const hasColors = !!(child.geometry && child.geometry.attributes && child.geometry.attributes.color);
+          const hasPBRMap = !!(child.material && (child.material.map || child.material.metalnessMap || child.material.roughnessMap));
+
+          if (stage === 0 || stage === 1) {
+            if (child.material) {
+              child.material.wireframe = wireframeMode;
+              if (child.material.map) {
+                child.material.map.encoding = THREE.sRGBEncoding;
+                child.material.map.needsUpdate = true;
+              }
+              if (child.material.roughnessMap || child.material.metalnessMap) {
+                child.material.roughness = 1.0;
+                child.material.metalness = 1.0;
+                child.material.needsUpdate = true;
+              } else if (!hasPBRMap && !hasColors) {
+                child.material = new THREE.MeshStandardMaterial({
+                  color: 0xd1d5db,
+                  roughness: 0.45,
+                  metalness: 0.1,
+                  wireframe: wireframeMode
+                });
+              }
+              if (hasColors) {
+                child.material.vertexColors = true;
+                child.material.needsUpdate = true;
+              }
+            }
           } else if (stage === 2) {
             child.material = new THREE.MeshStandardMaterial({
               color: 0x778899,
@@ -382,11 +599,30 @@ async function load3DForStage(stage) {
 
       currentMeshGroup.traverse((child) => {
         if (child.isMesh) {
-          child.material.wireframe = wireframeMode;
+          child.castShadow = true;
+          child.receiveShadow = true;
+          if (child.material) {
+            child.material.wireframe = wireframeMode;
+            if (child.material.map) {
+              child.material.map.encoding = THREE.sRGBEncoding;
+              child.material.map.needsUpdate = true;
+            }
+            if (child.material.roughnessMap || child.material.metalnessMap) {
+              child.material.roughness = 1.0;
+              child.material.metalness = 1.0;
+              child.material.needsUpdate = true;
+            }
+            const hasColors = !!(child.geometry && child.geometry.attributes && child.geometry.attributes.color);
+            if (hasColors) {
+              child.material.vertexColors = true;
+              child.material.needsUpdate = true;
+            }
+          }
         }
       });
 
       scene.add(currentMeshGroup);
+
 
       // Setup Animation Mixer
       if (gltf.animations && gltf.animations.length > 0) {
@@ -557,6 +793,28 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSystemInfo();
   loadHistory();
 
+  // Mode select checkbox initialization & persistence
+  const chkAutoFull = document.getElementById('chk-auto-full');
+  const modeBadge = document.getElementById('mode-badge');
+  const savedAutoFull = localStorage.getItem('unirig_auto_full');
+  if (chkAutoFull) {
+    chkAutoFull.checked = savedAutoFull !== null ? (savedAutoFull === 'true') : true;
+    const updateModeUI = () => {
+      if (modeBadge) {
+        if (chkAutoFull.checked) {
+          modeBadge.textContent = '3D + Rig + Motion';
+          modeBadge.className = 'status-badge completed';
+        } else {
+          modeBadge.textContent = 'Chỉ tạo Model 3D';
+          modeBadge.className = 'status-badge running';
+        }
+      }
+      localStorage.setItem('unirig_auto_full', chkAutoFull.checked ? 'true' : 'false');
+    };
+    chkAutoFull.onchange = updateModeUI;
+    updateModeUI();
+  }
+
   if (activeJobId) {
     selectJob(activeJobId);
   }
@@ -576,23 +834,114 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   });
 
-  // Custom File Upload
-  const uploadZone = document.getElementById('upload-zone');
-  const fileInput = document.getElementById('file-input');
-  uploadZone.onclick = () => fileInput.click();
+  // Generator selection state & click handlers
+  let selectedGenerator = localStorage.getItem('unirig_generator') || 'hunyuan3d';
+  const genBadge = document.getElementById('generator-badge');
+  const genButtons = document.querySelectorAll('.generator-btn');
 
-  fileInput.onchange = async (e) => {
-    if (fileInput.files.length === 0) return;
-    const file = fileInput.files[0];
-    const form = new FormData();
-    form.append('file', file);
-    const res = await fetch('/api/jobs/upload', { method: 'POST', body: form });
-    if (res.ok) {
-      const job = await res.json();
-      selectJob(job.id);
-      loadHistory();
+  const updateGeneratorUI = (gen) => {
+    selectedGenerator = gen;
+    localStorage.setItem('unirig_generator', gen);
+    genButtons.forEach(btn => {
+      btn.classList.toggle('active', btn.getAttribute('data-generator') === gen);
+    });
+    if (genBadge) {
+      genBadge.textContent = gen === 'hunyuan3d' ? 'Hunyuan3D-2.1' : 'TRELLIS.2-4B';
     }
   };
+
+  genButtons.forEach(btn => {
+    btn.onclick = () => {
+      const gen = btn.getAttribute('data-generator');
+      if (gen) updateGeneratorUI(gen);
+    };
+  });
+  updateGeneratorUI(selectedGenerator);
+
+  // Custom File Upload & Drag-and-Drop
+  const uploadZone = document.getElementById('upload-zone');
+  const fileInput = document.getElementById('file-input');
+
+  async function handleFileUpload(file) {
+    if (!file) return;
+    const form = new FormData();
+    form.append('file', file);
+    const isAutoFull = document.getElementById('chk-auto-full')?.checked ?? true;
+    form.append('mode', isAutoFull ? 'full' : '3d_only');
+    form.append('generator', selectedGenerator);
+
+    try {
+      const res = await fetch('/api/jobs/upload', { method: 'POST', body: form });
+      if (res.ok) {
+        const job = await res.json();
+        activeJobId = job.id;
+        localStorage.setItem('unirig_active_job_id', job.id);
+        currentJobData = job;
+        smoothProgressVal = 10;
+        updateUIWithJob(job);
+        startPolling(job.id);
+        loadHistory();
+      }
+    } catch (err) {
+      console.error("Upload error", err);
+    }
+  }
+
+
+  uploadZone.onclick = () => fileInput.click();
+  uploadZone.ondragover = (e) => {
+    e.preventDefault();
+    uploadZone.style.borderColor = 'var(--accent-cyan)';
+    uploadZone.style.background = 'rgba(0, 242, 254, 0.08)';
+  };
+  uploadZone.ondragleave = () => {
+    uploadZone.style.borderColor = '';
+    uploadZone.style.background = '';
+  };
+  uploadZone.ondrop = (e) => {
+    e.preventDefault();
+    uploadZone.style.borderColor = '';
+    uploadZone.style.background = '';
+    if (e.dataTransfer.files.length > 0) {
+      handleFileUpload(e.dataTransfer.files[0]);
+    }
+  };
+
+  fileInput.onchange = (e) => {
+    if (fileInput.files.length > 0) {
+      handleFileUpload(fileInput.files[0]);
+    }
+  };
+
+  // Run Full Pipeline / Trigger Continuation Button
+  const btnRunPipeline = document.getElementById('btn-run-pipeline');
+  if (btnRunPipeline) {
+    btnRunPipeline.onclick = async () => {
+      if (!currentJobData) {
+        fileInput.click();
+        return;
+      }
+      btnRunPipeline.disabled = true;
+      btnRunPipeline.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang khởi chạy...';
+      try {
+        const res = await fetch(`/api/jobs/${currentJobData.id}/continue_rigging`, { method: 'POST' });
+        if (res.ok) {
+          smoothProgressVal = 20;
+          startPolling(currentJobData.id);
+          loadHistory();
+        } else {
+          const err = await res.json();
+          alert(`Lỗi: ${err.detail || 'Không thể tiếp tục pipeline'}`);
+        }
+      } catch (e) {
+        console.error("Error re-triggering pipeline", e);
+        alert(`Lỗi: ${e.message}`);
+      } finally {
+        btnRunPipeline.disabled = false;
+        btnRunPipeline.innerHTML = '<i class="fa-solid fa-bolt"></i> Chạy Full Pipeline';
+      }
+    };
+  }
 
   // Stage tab clicks
   document.querySelectorAll('.stage-tab').forEach(tab => {
@@ -610,13 +959,84 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   });
 
+  // Continue rigging from Stage 0 button
+  const btnContinue = document.getElementById('btn-continue-rigging');
+  if (btnContinue) {
+    btnContinue.onclick = async () => {
+      if (!currentJobData) return;
+      btnContinue.disabled = true;
+      btnContinue.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang chạy Rigging...';
+      try {
+        const res = await fetch(`/api/jobs/${currentJobData.id}/continue_rigging`, { method: 'POST' });
+        if (res.ok) {
+          smoothProgressVal = 20;
+          startPolling(currentJobData.id);
+          loadHistory();
+        } else {
+          const err = await res.json();
+          alert(`Lỗi: ${err.detail}`);
+        }
+      } catch (e) {
+        alert(`Lỗi kích hoạt Rigging: ${e.message}`);
+      } finally {
+        btnContinue.innerHTML = '<i class="fa-solid fa-play"></i> Chạy tiếp Pipeline Rig & Animation';
+      }
+    };
+  }
+
+
+  // Banner overlay buttons
+  const bannerBtnDl = document.getElementById('banner-btn-download-3d');
+  if (bannerBtnDl) {
+    bannerBtnDl.onclick = () => {
+      if (currentJobData) window.open(`/api/jobs/${currentJobData.id}/files/generated_3d_glb`, '_blank');
+    };
+  }
+  const bannerBtnContinue = document.getElementById('banner-btn-continue');
+  if (bannerBtnContinue) {
+    bannerBtnContinue.onclick = () => {
+      if (btnContinue) btnContinue.click();
+    };
+  }
+
   // Download buttons
-  document.getElementById('btn-download-glb').onclick = () => {
-    if (currentJobData) window.open(`/api/jobs/${currentJobData.id}/files/rigged_glb`, '_blank');
-  };
-  document.getElementById('btn-download-obj').onclick = () => {
-    if (currentJobData) window.open(`/api/jobs/${currentJobData.id}/files/skeleton_obj`, '_blank');
-  };
+  const btnDownload3D = document.getElementById('btn-download-3d-stage0');
+  if (btnDownload3D) {
+    btnDownload3D.onclick = () => {
+      if (currentJobData) {
+        window.open(`/api/jobs/${currentJobData.id}/files/generated_3d_glb`, '_blank');
+      }
+    };
+  }
+
+  const btnPreviewDownload3D = document.getElementById('btn-preview-download-3d');
+  if (btnPreviewDownload3D) {
+    btnPreviewDownload3D.onclick = (e) => {
+      e.stopPropagation();
+      if (currentJobData) {
+        window.open(`/api/jobs/${currentJobData.id}/files/generated_3d_glb`, '_blank');
+      }
+    };
+  }
+
+  const btnDownloadGlb = document.getElementById('btn-download-glb');
+  if (btnDownloadGlb) {
+    btnDownloadGlb.onclick = () => {
+      if (!currentJobData) return;
+      if (currentJobData.status === 'completed') {
+        window.open(`/api/jobs/${currentJobData.id}/files/rigged_glb`, '_blank');
+      } else {
+        window.open(`/api/jobs/${currentJobData.id}/files/generated_3d_glb`, '_blank');
+      }
+    };
+  }
+
+  const btnDownloadObj = document.getElementById('btn-download-obj');
+  if (btnDownloadObj) {
+    btnDownloadObj.onclick = () => {
+      if (currentJobData) window.open(`/api/jobs/${currentJobData.id}/files/skeleton_obj`, '_blank');
+    };
+  }
 
   // Toolbar toggles
   document.getElementById('btn-toggle-wireframe').onclick = (e) => {
@@ -666,9 +1086,6 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   document.getElementById('btn-refresh-jobs').onclick = () => loadHistory();
-  document.getElementById('btn-run-pipeline').onclick = () => {
-    if (currentJobData) selectJob(currentJobData.id);
-  };
   document.getElementById('btn-reanimate-fast').onclick = async () => {
     if (!currentJobData) return;
     const btn = document.getElementById('btn-reanimate-fast');

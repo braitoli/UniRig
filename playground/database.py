@@ -8,9 +8,11 @@ DB_PATH = Path(__file__).resolve().parent / "storage/playground.db"
 
 def get_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -35,14 +37,15 @@ def init_db():
         """)
     conn.close()
 
-def create_job(job_id: str, title: str, input_filename: str, input_file_path: str) -> Dict[str, Any]:
+def create_job(job_id: str, title: str, input_filename: str, input_file_path: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     conn = get_db()
     now = time.time()
+    meta_json = json.dumps(metadata) if metadata is not None else json.dumps({})
     with conn:
         conn.execute("""
         INSERT INTO jobs (id, title, status, stage, input_filename, input_file_path, created_at, updated_at, metadata)
         VALUES (?, ?, 'queued', 1, ?, ?, ?, ?, ?)
-        """, (job_id, title, input_filename, input_file_path, now, now, json.dumps({})))
+        """, (job_id, title, input_filename, input_file_path, now, now, meta_json))
     conn.close()
     return get_job(job_id)
 

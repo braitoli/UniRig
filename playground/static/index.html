@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>UniRig — 3D Skeleton, Skinning & Animation Playground</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=2.0">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- Three.js & Loaders -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -63,12 +63,53 @@
           </button>
         </div>
 
+        <!-- 2D to 3D Generator Selection -->
+        <div class="generator-select-container" style="margin-bottom: 10px;">
+          <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between;">
+            <span><i class="fa-solid fa-wand-magic-sparkles"></i> AI Image-to-3D Model</span>
+            <span id="generator-badge" style="font-size: 10px; color: var(--accent-cyan); background: rgba(0, 242, 254, 0.1); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(0, 242, 254, 0.2);">Hunyuan3D-2.1</span>
+          </div>
+          <div class="generator-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+            <button type="button" class="generator-btn active" data-generator="hunyuan3d" id="btn-gen-hunyuan3d" title="Tencent Hunyuan3D-2.1 High-Resolution 3D Foundation Model">
+              <i class="fa-solid fa-ghost"></i> Hunyuan3D-2.1
+            </button>
+            <button type="button" class="generator-btn" data-generator="trellis" id="btn-gen-trellis" title="Microsoft TRELLIS.2-4B Unified 3D Model">
+              <i class="fa-solid fa-bolt"></i> TRELLIS.2-4B
+            </button>
+          </div>
+        </div>
+
         <!-- Custom Upload -->
         <div class="upload-dropzone" id="upload-zone">
           <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
-          <div style="font-size: 12px; font-weight: 600; color: #fff;">Kéo thả hoặc chọn file 3D</div>
-          <div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">.GLB, .OBJ, .GLTF</div>
-          <input type="file" id="file-input" accept=".glb,.gltf,.obj" style="display: none;">
+          <div style="font-size: 12px; font-weight: 600; color: #fff;">Kéo thả ảnh 2D hoặc file 3D</div>
+          <div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">.PNG, .JPG, .WEBP, .GLB, .OBJ</div>
+          <input type="file" id="file-input" accept=".glb,.gltf,.obj,.png,.jpg,.jpeg,.webp,.bmp" style="display: none;">
+        </div>
+
+        <!-- Mode Select Box -->
+        <div class="mode-select-box" style="margin-top: 10px; background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px;">
+          <div style="display: flex; align-items: center; justify-content: space-between;">
+            <label for="chk-auto-full" style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; font-weight: 600; color: #fff;">
+              <input type="checkbox" id="chk-auto-full" checked style="cursor: pointer; width: 16px; height: 16px; accent-color: var(--accent-cyan);">
+              <span>Tự động chạy Full Pipeline</span>
+            </label>
+            <span class="status-badge completed" id="mode-badge" style="font-size: 10px;">3D + Rig + Motion</span>
+          </div>
+          <div id="mode-desc" style="font-size: 11px; color: var(--text-muted); margin-top: 5px; padding-left: 24px; line-height: 1.4;">
+            Sau khi tạo 3D từ ảnh 2D (Hunyuan3D-2.1 / TRELLIS.2), tự động dự đoán hệ xương và tạo 5 animation chuyển động.
+          </div>
+        </div>
+
+        <!-- 2D Image Preview Card (hidden by default) -->
+        <div id="image-preview-card" style="display: none; margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; text-align: center;">
+          <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+            <span><i class="fa-regular fa-image"></i> Ảnh 2D Input</span>
+            <button id="btn-preview-download-3d" style="background: rgba(0,242,254,0.15); border: 1px solid var(--accent-cyan); color: var(--accent-cyan); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; cursor: pointer;" title="Tải file 3D GLB thô vừa tạo">
+              <i class="fa-solid fa-cube"></i> Tải 3D GLB
+            </button>
+          </div>
+          <img id="image-preview-img" src="" alt="2D Input Preview" style="max-width: 100%; max-height: 120px; border-radius: 6px; object-fit: contain; background: #1a1a24;">
         </div>
       </div>
 
@@ -79,6 +120,19 @@
         </div>
 
         <div class="stage-stepper">
+          <!-- Step 0 (2D Image to 3D Model) -->
+          <div class="stage-step" data-step="0" id="step-card-0" style="display: none;">
+            <div class="step-num">0</div>
+            <div class="step-info">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div class="step-name">2D Image → 3D Model</div>
+                <span id="step-0-badge" class="status-badge running" style="font-size: 9px; padding: 1px 6px; display: none;">0%</span>
+              </div>
+              <div class="step-desc" id="step-0-desc">Tencent Hunyuan3D-2.1 / TRELLIS.2</div>
+            </div>
+            <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
+          </div>
+
           <!-- Step 1 -->
           <div class="stage-step" data-step="1" id="step-card-1">
             <div class="step-num">1</div>
@@ -120,13 +174,18 @@
           </div>
         </div>
 
-        <div style="margin-top: 14px; display: flex; gap: 8px;">
-          <button id="btn-run-pipeline" class="btn-primary" style="flex: 1;">
-            <i class="fa-solid fa-bolt"></i> Chạy Full Pipeline
+        <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 8px;">
+          <button id="btn-continue-rigging" class="btn-primary" style="display: none; background: linear-gradient(135deg, #10b981, #059669);">
+            <i class="fa-solid fa-play"></i> Chạy tiếp Pipeline Rig & Animation
           </button>
-          <button id="btn-reanimate-fast" class="btn-secondary" style="flex: 1; background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); font-size: 11px; padding: 8px 10px;" title="Chạy lại ngay lập tức phần tạo chuyển động (0.1s) không cần chạy lại AI model">
-            <i class="fa-solid fa-person-running"></i> Tạo Motion (0.1s)
-          </button>
+          <div style="display: flex; gap: 8px;">
+            <button id="btn-run-pipeline" class="btn-primary" style="flex: 1;">
+              <i class="fa-solid fa-bolt"></i> Chạy Full Pipeline
+            </button>
+            <button id="btn-reanimate-fast" class="btn-secondary" style="flex: 1; margin-top: 0; background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); font-size: 11px; padding: 8px 10px;" title="Chạy lại ngay lập tức phần tạo chuyển động (0.1s) không cần chạy lại AI model">
+              <i class="fa-solid fa-person-running"></i> Tạo Motion (0.1s)
+            </button>
+          </div>
         </div>
       </div>
 
@@ -135,11 +194,14 @@
         <div class="section-title">
           <span><i class="fa-solid fa-download"></i> Tải Về Kết Quả</span>
         </div>
-        <button id="btn-download-glb" class="btn-secondary" disabled>
-          <i class="fa-solid fa-file-arrow-down"></i> Tải Rigged & Animated .GLB
+        <button id="btn-download-3d-stage0" class="btn-secondary" style="margin-top: 0; background: rgba(0, 242, 254, 0.1); border-color: rgba(0, 242, 254, 0.3); color: #fff;" disabled>
+          <i class="fa-solid fa-cube" style="color: var(--accent-cyan);"></i> Tải Model 3D (.GLB)
+        </button>
+        <button id="btn-download-glb" class="btn-secondary" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.4); color: #fff;" disabled>
+          <i class="fa-solid fa-file-arrow-down" style="color: var(--accent-emerald);"></i> Tải Rigged & Animated (.GLB)
         </button>
         <button id="btn-download-obj" class="btn-secondary" disabled>
-          <i class="fa-solid fa-bone"></i> Tải Skeleton .OBJ
+          <i class="fa-solid fa-bone" style="color: #f59e0b;"></i> Tải Skeleton (.OBJ)
         </button>
       </div>
 
@@ -177,6 +239,47 @@
 
       <!-- 3D Canvas -->
       <div id="canvas-wrapper" style="width: 100%; height: 100%;"></div>
+
+      <!-- Loading & Processing Banner Overlay -->
+      <div id="viewport-processing-overlay" style="display: none; position: absolute; top: 60px; left: 50%; transform: translateX(-50%); z-index: 100; background: rgba(15, 23, 42, 0.94); border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 14px; padding: 16px 24px; backdrop-filter: blur(12px); box-shadow: 0 12px 32px rgba(0,0,0,0.6); text-align: center; color: #fff; width: 440px; max-width: 90%;">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <i id="overlay-icon" class="fa-solid fa-spinner fa-spin" style="font-size: 18px; color: var(--accent-cyan);"></i>
+            <div id="overlay-title" style="font-size: 14px; font-weight: 700; color: #fff;">Đang xử lý...</div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span id="overlay-step-badge" style="font-size: 10px; font-weight: 700; color: var(--accent-cyan); background: rgba(0, 242, 254, 0.12); border: 1px solid rgba(0, 242, 254, 0.3); padding: 2px 8px; border-radius: 12px;">Bước 1/5</span>
+            <span id="overlay-progress-pct" style="font-size: 13px; font-weight: 800; color: #34d399; font-variant-numeric: tabular-nums;">15%</span>
+          </div>
+        </div>
+
+        <!-- Progress Bar Track -->
+        <div class="progress-track" style="width: 100%; height: 6px; background: rgba(255, 255, 255, 0.1); border-radius: 3px; overflow: hidden; margin-bottom: 8px;">
+          <div id="overlay-progress-bar" style="width: 15%; height: 100%; background: linear-gradient(90deg, #00f2fe 0%, #4facfe 50%, #10b981 100%); border-radius: 3px; transition: width 0.4s ease-in-out; box-shadow: 0 0 10px rgba(0, 242, 254, 0.5);"></div>
+        </div>
+
+        <!-- Substep description -->
+        <div id="overlay-desc" style="font-size: 12px; color: var(--text-muted); text-align: left; line-height: 1.4; display: flex; align-items: center; gap: 6px;">
+          <i class="fa-solid fa-angles-right" style="font-size: 10px; color: var(--accent-cyan);"></i>
+          <span id="overlay-desc-text">Vui lòng đợi trong giây lát...</span>
+        </div>
+      </div>
+
+      <!-- Stage 0 Completed Banner Overlay -->
+      <div id="viewport-completed-banner" style="display: none; position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); z-index: 100; background: rgba(15, 23, 42, 0.95); border: 1px solid rgba(16, 185, 129, 0.5); border-radius: 12px; padding: 14px 20px; backdrop-filter: blur(10px); box-shadow: 0 10px 30px rgba(0,0,0,0.6); text-align: center; color: #fff; max-width: 90%;">
+        <div id="banner-completed-title" style="font-size: 13px; font-weight: 600; color: #34d399; margin-bottom: 8px;">
+          <i class="fa-solid fa-circle-check"></i> Đã tạo xong Model 3D từ Ảnh 2D!
+        </div>
+        <div style="display: flex; gap: 10px; justify-content: center;">
+          <button id="banner-btn-download-3d" class="btn-primary" style="font-size: 12px; padding: 8px 14px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);">
+            <i class="fa-solid fa-cube"></i> Tải về GLB (3D Thô)
+          </button>
+          <button id="banner-btn-continue" class="btn-primary" style="font-size: 12px; padding: 8px 16px; background: linear-gradient(135deg, #10b981, #059669);">
+            <i class="fa-solid fa-play"></i> Chạy tiếp Rig & Animation 3D
+          </button>
+        </div>
+      </div>
+
 
       <!-- Animation Playback Floating Bar (Stage 4) -->
       <div class="anim-bar" id="anim-bar" style="display: none;">
@@ -246,6 +349,7 @@
 
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=2.0"></script>
 </body>
 </html>
+

@@ -63,24 +63,44 @@ class SkeletonClassifier:
         self.lr_axis = 0
         self.fw_axis = 2
         
-        # 1. Identify main spine chain from root upwards
-        self.spine_chain = []
-        curr = self.root_idx
-        while curr is not None:
-            self.spine_chain.append(curr)
-            cand_children = self.children[curr]
-            if len(cand_children) == 0:
-                break
-            best_c = None
-            best_score = -1e9
-            for c in cand_children:
-                dist_lr = abs(self.joints[c][self.lr_axis] - self.joints[self.root_idx][self.lr_axis])
-                up_pos = self.joints[c][self.up_axis]
-                score = up_pos - 2.0 * dist_lr
-                if score > best_score:
-                    best_score = score
-                    best_c = c
-            curr = best_c
+        # 1. Identify main spine chain, following the body's longest axis away from the root.
+        # An upright biped is tallest along `up`, but a quadruped is longest along `forward`:
+        # walking "upwards" on a horizontal body climbs a front leg instead of the backbone,
+        # which then feeds a foreleg's rotation to whatever the target's spine is.
+        body_axis = self.fw_axis if span[self.fw_axis] > span[self.up_axis] else self.up_axis
+
+        # Judge a branch by how far it eventually reaches along the body axis, not by where its
+        # first joint sits: a shoulder can sit closer to the mid-line than the neck does, and
+        # scoring on the immediate joint alone then picks the whole front leg as the backbone.
+        centre_lr = float(np.median(self.joints[:, self.lr_axis]))
+
+        def walk_spine(sign: int) -> List[int]:
+            chain = []
+            curr = self.root_idx
+            while curr is not None:
+                chain.append(curr)
+                cand_children = self.children[curr]
+                if len(cand_children) == 0:
+                    break
+                best_c = None
+                best_score = -1e9
+                for c in cand_children:
+                    reach = max(sign * self.joints[j][body_axis] for j in self._get_sub_tree(c))
+                    dist_lr = abs(self.joints[c][self.lr_axis] - centre_lr)
+                    score = reach - 0.25 * dist_lr
+                    if score > best_score:
+                        best_score = score
+                        best_c = c
+                curr = best_c
+            return chain
+
+        if body_axis == self.up_axis:
+            self.spine_chain = walk_spine(1)
+        else:
+            # Along the forward axis the head could be at either end, so follow whichever
+            # direction traces the longer backbone (the other one runs down the tail).
+            forward, backward = walk_spine(1), walk_spine(-1)
+            self.spine_chain = forward if len(forward) >= len(backward) else backward
 
         self.head_idx = self.spine_chain[-1] if self.spine_chain else self.root_idx
         spine_x = np.median(self.joints[self.spine_chain, self.lr_axis])
@@ -93,13 +113,26 @@ class SkeletonClassifier:
         self.tail_branches = []
         
         skel_height = span[self.up_axis] + 1e-6
+        ground = j_min[self.up_axis]
 
         for idx, spine_j in enumerate(self.spine_chain):
-            for child in self.children[spine_j]:
-                if child in self.spine_chain:
-                    continue
-                # Traverse full branch starting at `child`
-                branch = self._get_sub_tree(child)
+            siblings = [c for c in self.children[spine_j] if c not in self.spine_chain]
+            if not siblings:
+                continue
+            # A left/right limb pair always hangs off the same spine joint, so split the
+            # siblings against each other. An absolute mid-line (the spine's median, or the
+            # spine joint itself) puts both legs on one side whenever the skeleton sits
+            # off-centre, and a side with no branches leaves those joints unanimated.
+            # The key averages the whole branch because the attachment joint alone can be
+            # identical for both sides -- a giraffe's two shoulders sit right on the mid-line.
+            sib_branches = {c: self._get_sub_tree(c) for c in siblings}
+            sib_lr = {c: float(np.mean(self.joints[b, self.lr_axis]))
+                      for c, b in sib_branches.items() if b}
+            mid_lr = (min(sib_lr.values()) + max(sib_lr.values())) / 2.0 if len(sib_lr) >= 2 \
+                else float(self.joints[spine_j][self.lr_axis])
+
+            for child in siblings:
+                branch = sib_branches[child]
                 if not branch:
                     continue
                     
@@ -109,12 +142,13 @@ class SkeletonClassifier:
                 tip_j = branch_sorted[-1]
                 
                 dir_vec = self.joints[tip_j] - self.joints[root_j]
-                mean_x = np.mean(self.joints[branch, self.lr_axis])
-                is_left = (mean_x < spine_x)
+                is_left = (sib_lr[child] < mid_lr)
                 
-                # Check direction:
-                # Downward pointing = Leg
-                if dir_vec[self.up_axis] < -0.10 * skel_height:
+                # A limb is a leg when its tip reaches the floor, not merely when it points
+                # downward -- a human's arms hang down too, and classifying them as legs
+                # makes a biped read as a quadruped (and get a dog's gait retargeted onto it).
+                tip_height = (self.joints[tip_j][self.up_axis] - ground) / skel_height
+                if tip_height < 0.15:
                     if is_left:
                         self.left_leg_branches.append(branch_sorted)
                     else:
@@ -123,7 +157,13 @@ class SkeletonClassifier:
                 else:
                     fw_len = abs(dir_vec[self.fw_axis])
                     lr_len = abs(dir_vec[self.lr_axis])
-                    if fw_len > 1.5 * lr_len:
+                    # A tail runs along the mid-line, while a limb is displaced to one side.
+                    # Direction alone is not enough: an arm swung forward in a running clip
+                    # points the same way a tail does, and calling it a tail leaves that whole
+                    # side of the target with no rotation tracks at all.
+                    spread = max(sib_lr.values()) - min(sib_lr.values()) if len(sib_lr) >= 2 else 0.0
+                    on_midline = abs(sib_lr[child] - mid_lr) <= 0.25 * spread
+                    if fw_len > 1.5 * lr_len and on_midline:
                         self.tail_branches.append(branch_sorted)
                     else:
                         if is_left:
@@ -145,6 +185,110 @@ class SkeletonClassifier:
             res.append(curr)
             stack.extend(self.children[curr])
         return res
+
+# Anatomical name segments for a single limb branch, ordered top (closest to spine) to tip.
+_LEG_SEGMENT_NAMES = ["UpLeg", "Leg", "Foot", "ToeBase"]
+_ARM_SEGMENT_NAMES = ["Shoulder", "Arm", "ForeArm", "Hand"]
+# Spine chain names for common chain lengths, ordered root -> head.
+_SPINE_NAMES_BY_LENGTH = {
+    1: ["Hips"],
+    2: ["Hips", "Head"],
+    3: ["Hips", "Spine", "Head"],
+    4: ["Hips", "Spine", "Neck", "Head"],
+    5: ["Hips", "Spine", "Spine1", "Neck", "Head"],
+    6: ["Hips", "Spine", "Spine1", "Spine2", "Neck", "Head"],
+}
+
+
+def _segment_names(count: int, base_names: List[str]) -> List[str]:
+    """Returns `count` segment names, extending the last name with numeric suffixes
+    (e.g. Foot, Foot1, Foot2...) if the branch is longer than the base list."""
+    if count <= len(base_names):
+        return base_names[:count]
+    names = list(base_names)
+    last = base_names[-1]
+    extra = count - len(base_names)
+    names.extend(f"{last}{i}" for i in range(1, extra + 1))
+    return names
+
+
+def _spine_names(count: int) -> List[str]:
+    if count in _SPINE_NAMES_BY_LENGTH:
+        return _SPINE_NAMES_BY_LENGTH[count]
+    if count < 1:
+        return []
+    if count > 6:
+        # Insert extra numbered Spine segments between Spine1 and Neck.
+        base = _SPINE_NAMES_BY_LENGTH[6]
+        extra = count - 6
+        insert_at = base.index("Spine2") + 1
+        extra_names = [f"Spine{2 + i}" for i in range(1, extra + 1)]
+        return base[:insert_at] + extra_names + base[insert_at:]
+    # Fewer than 6: drop from the middle-most optional names first (Spine2, Spine1, Neck).
+    base = _SPINE_NAMES_BY_LENGTH[6]
+    drop_order = ["Spine2", "Spine1", "Neck"]
+    names = list(base)
+    for name in drop_order:
+        if len(names) <= count:
+            break
+        names.remove(name)
+    return names
+
+
+def assign_anatomical_names(classifier: "SkeletonClassifier") -> List[str]:
+    """
+    Assigns Mixamo-style anatomical joint names (prefixed `mixamorig:`) to every joint
+    in a classified skeleton, based purely on structural role (spine chain, limb branch
+    position) since UniRig's predicted joints carry no meaningful names of their own.
+
+    Quadruped/multi-limb skeletons get Front/Hind leg-branch disambiguation (sorted by
+    the forward axis), and any detected tail branches are named Tail, Tail1, ...
+    Joints not covered by any recognized role keep a generic `mixamorig:Bone_<idx>` name.
+    """
+    names = [f"mixamorig:Bone_{i}" for i in range(classifier.J)]
+
+    spine_names = _spine_names(len(classifier.spine_chain))
+    for idx, joint in enumerate(classifier.spine_chain):
+        if idx < len(spine_names):
+            names[joint] = f"mixamorig:{spine_names[idx]}"
+
+    def _branch_prefix(b_idx: int, total: int, side: str) -> str:
+        """Two branches per side => Front/Hind (quadruped legs). More than two =>
+        numbered suffix to keep every branch's names unique."""
+        if total <= 1:
+            return side
+        if total == 2:
+            return f"{side}Front" if b_idx == 0 else f"{side}Hind"
+        suffix = "" if b_idx == 0 else str(b_idx)
+        return f"{side}Limb{suffix}"
+
+    def _name_leg_branches(branches: List[List[int]], side: str):
+        branches_sorted = sorted(branches, key=lambda b: classifier.joints[b[0]][classifier.fw_axis], reverse=True)
+        for b_idx, branch in enumerate(branches_sorted):
+            prefix = _branch_prefix(b_idx, len(branches_sorted), side)
+            seg_names = _segment_names(len(branch), _LEG_SEGMENT_NAMES)
+            for seg_idx, joint in enumerate(branch):
+                names[joint] = f"mixamorig:{prefix}{seg_names[seg_idx]}"
+
+    def _name_arm_branches(branches: List[List[int]], side: str):
+        for b_idx, branch in enumerate(branches):
+            prefix = _branch_prefix(b_idx, len(branches), side)
+            seg_names = _segment_names(len(branch), _ARM_SEGMENT_NAMES)
+            for seg_idx, joint in enumerate(branch):
+                names[joint] = f"mixamorig:{prefix}{seg_names[seg_idx]}"
+
+    _name_leg_branches(classifier.left_leg_branches, "Left")
+    _name_leg_branches(classifier.right_leg_branches, "Right")
+    _name_arm_branches(classifier.left_arm_branches, "Left")
+    _name_arm_branches(classifier.right_arm_branches, "Right")
+
+    for b_idx, branch in enumerate(classifier.tail_branches):
+        suffix = "" if b_idx == 0 else str(b_idx)
+        for seg_idx, joint in enumerate(branch):
+            tail_num = seg_idx if seg_idx > 0 else ""
+            names[joint] = f"mixamorig:Tail{suffix}{tail_num}"
+
+    return names
 
 def generate_standard_animations(
     joints: np.ndarray,
