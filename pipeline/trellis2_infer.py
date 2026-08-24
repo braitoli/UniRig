@@ -65,7 +65,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help="Random seed")
     parser.add_argument('--resolution', type=str, default="1024", choices=["512", "1024", "1536"])
     parser.add_argument('--decimation_target', type=int, default=300000)
-    parser.add_argument('--texture_size', type=int, default=2048)
+    parser.add_argument('--texture_size', type=int, default=4096)
     args = parser.parse_args()
 
     print(f"[TRELLIS.2] Loading Trellis2ImageTo3DPipeline (microsoft/TRELLIS.2-4B)...")

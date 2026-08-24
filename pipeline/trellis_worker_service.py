@@ -115,7 +115,8 @@ class GenerateRequest(BaseModel):
     seed: int = 42
     resolution: str = "1024"
     decimation_target: int = 300000
-    texture_size: int = 2048
+    texture_size: int = 4096
+    tex_slat_steps: int = 12
 
 @app.post("/generate")
 async def generate_3d(req: GenerateRequest):
@@ -157,7 +158,7 @@ async def generate_3d(req: GenerateRequest):
                 "rescale_t": 3.0,
             },
             tex_slat_sampler_params={
-                "steps": 12,
+                "steps": req.tex_slat_steps,
                 "guidance_strength": 1.0,
                 "guidance_rescale": 0.0,
                 "rescale_t": 3.0,

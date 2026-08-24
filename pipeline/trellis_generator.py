@@ -163,9 +163,12 @@ class TrellisImageTo3DGenerator:
                             "seed": seed,
                             "resolution": "1024",
                             "decimation_target": min(decimate_target, 300000) if decimate_target else 300000,
-                            "texture_size": 2048
+                            "texture_size": 4096
                         }
-                        resp = requests.post(f"http://127.0.0.1:{worker_port}/generate", json=payload, timeout=300)
+                        # Must exceed worst-case bake time (texture_size=4096 measured at ~360s,
+                        # slower when the GPU is shared); a premature timeout drops us onto the
+                        # subprocess path, which reloads the whole 4B model from scratch.
+                        resp = requests.post(f"http://127.0.0.1:{worker_port}/generate", json=payload, timeout=1800)
 
                         if resp.status_code == 200:
                             call_state["res"] = resp.json()
@@ -180,7 +183,7 @@ class TrellisImageTo3DGenerator:
                 w_thread.start()
 
                 t_w_start = time.time()
-                est_duration = 35.0
+                est_duration = 360.0
                 while not call_state["done"]:
                     elapsed = time.time() - t_w_start
                     ratio = min(1.0, elapsed / est_duration)
