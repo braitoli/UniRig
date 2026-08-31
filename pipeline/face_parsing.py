@@ -40,6 +40,13 @@ BROW_LABELS = (6, 7)         # l_brow, r_brow
 # because they drive a different blendshape family.
 EYE_REGION_LABELS = EYE_LABELS + GLASSES_LABELS
 
+# Everything that belongs to a face rather than to the head or the body: skin, nose, eyes,
+# brows, mouth and lips, but not hair, ears, neck or clothing. Used to work out where the
+# face actually is before asking a finer question about a part of it -- the face labels
+# cover thousands of pixels where an eye covers hundreds, so they survive a framing that
+# an eye does not.
+FACE_LABELS = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12)
+
 # A pixel the model is less sure than this about is treated as unclassified rather than
 # taken at face value. Ported from the FaceParsing reference implementation, where the
 # same threshold guards the same back-projection step.

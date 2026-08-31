@@ -10,6 +10,7 @@ fast-simplification
 bpy==4.2
 flash_attn
 trimesh
+rtree
 open3d
 pyrender
 PyOpenGL-accelerate

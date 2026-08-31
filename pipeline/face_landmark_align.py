@@ -13,6 +13,7 @@ that a spatial-only nearest-neighbor correspondence cannot recover on its own.
 import os
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -147,7 +148,22 @@ def _valid_depth_near(depth: np.ndarray, px: int, py: int, window: int = 3) -> O
     return best[1] if best is not None else None
 
 
-def locate_face_landmarks_3d(
+@dataclass
+class FaceLandmarks:
+    """Landmarks located on a mesh.
+
+    `groups` is the per-feature centroid map the alignment used before dense landmarks
+    existed. `dense_indices` / `dense_points` carry the individual MediaPipe landmarks
+    that survived multi-view agreement -- both `flame-fitting` and DECA drive their fit
+    from the individual points (51 and 68 respectively), never from group centroids,
+    because a centroid moves as the visible subset of its group changes with the view.
+    """
+    groups: Dict[str, np.ndarray]
+    dense_indices: np.ndarray   # (K,) MediaPipe landmark indices
+    dense_points: np.ndarray    # (K, 3) fused 3D positions
+
+
+def detect_face_landmarks(
     vertices: np.ndarray,
     faces: np.ndarray,
     center: np.ndarray,
@@ -155,14 +171,22 @@ def locate_face_landmarks_3d(
     vertex_colors: Optional[np.ndarray] = None,
     num_angles: int = 24,
     image_size: int = 512,
-) -> Optional[Dict[str, np.ndarray]]:
+    min_views: int = 2,
+    max_spread_ratio: float = 0.10,
+) -> Optional[FaceLandmarks]:
     """
     Sweeps `num_angles` yaw angles around `center`, rendering the mesh and running
     MediaPipe FaceLandmarker on each view. A real face is visible across a range of
     nearby angles, not just one -- so this picks the longest run of consecutive
-    successful detections (an isolated single-angle hit is more likely noise) and
-    backprojects each detected feature group's centroid to 3D through that view's
-    depth buffer. Returns None if no face was found at any angle.
+    successful detections (an isolated single-angle hit is more likely noise).
+
+    Every landmark is then backprojected through the depth buffer of *every* view in that
+    run and fused by taking the per-index median. A landmark whose backprojections
+    disagree across views by more than `max_spread_ratio` of the head radius is dropped:
+    that disagreement is the signature of a point MediaPipe placed on a silhouette edge,
+    where the depth buffer jumps between the face and whatever is behind it.
+
+    Returns None if no face was found at any angle.
     """
     import pyrender
     import mediapipe as mp
@@ -211,24 +235,87 @@ def locate_face_landmarks_3d(
     if len(best_run) < MIN_RUN_LENGTH:
         return None
 
-    best_idx = best_run[len(best_run) // 2]
-    landmarks, depth, cam_pose, yfov = renders[best_idx]
+    # Fuse over a window rather than the whole run: at the ends of a run the face is up to
+    # 60 degrees away, where a landmark near the silhouette backprojects to a completely
+    # different surface point and would poison the median instead of refining it.
+    #
+    # Centre that window on the most frontal view, measured by the horizontal spread of
+    # the detected landmarks -- a face turned away is foreshortened, so its landmarks are
+    # compressed in image x. Taking the middle of the run instead was measured to leave
+    # the template with 284 landmarks on one side of the face against 123 on the other,
+    # because the run need not be centred on the front; that asymmetry then propagated
+    # into the fit, which recovered every "Left" shape more accurately than its "Right"
+    # counterpart.
+    def frontality(view_idx: int) -> float:
+        landmarks = renders[view_idx][0]
+        xs = [lm.x for lm in landmarks]
+        return (max(xs) - min(xs)) if xs else 0.0
 
-    out: Dict[str, np.ndarray] = {}
-    for name, idxs in groups.items():
-        pts = []
-        for li in idxs:
-            if li >= len(landmarks):
-                continue
-            lm = landmarks[li]
+    centre = max(range(len(best_run)), key=lambda k: frontality(best_run[k]))
+    half = min(2, len(best_run) // 2)
+    window = best_run[max(0, centre - half): centre + half + 1]
+
+    observations: Dict[int, List[np.ndarray]] = {}
+    for view_idx in window:
+        landmarks, depth, cam_pose, yfov = renders[view_idx]
+        for li, lm in enumerate(landmarks):
             px, py = lm.x * image_size, lm.y * image_size
             d = _valid_depth_near(depth, int(round(px)), int(round(py)))
             if d is not None:
-                pts.append(_backproject(px, py, d, cam_pose, yfov, image_size))
+                observations.setdefault(li, []).append(
+                    _backproject(px, py, d, cam_pose, yfov, image_size))
+
+    required_views = min(min_views, len(window))
+    max_spread = radius * max_spread_ratio
+
+    dense_idx: List[int] = []
+    dense_pts: List[np.ndarray] = []
+    for li, pts in observations.items():
+        if len(pts) < required_views:
+            continue
+        stack = np.stack(pts)
+        med = np.median(stack, axis=0)
+        # Median deviation, not maximum: one bad view out of five should cost that view,
+        # not the landmark.
+        if len(stack) > 2 and float(np.median(np.linalg.norm(stack - med, axis=1))) > max_spread:
+            continue
+        dense_idx.append(li)
+        dense_pts.append(med.astype(np.float32))
+
+    if not dense_pts:
+        return None
+
+    dense_indices = np.asarray(dense_idx, dtype=np.int32)
+    dense_points = np.stack(dense_pts).astype(np.float32)
+
+    # Group centroids stay available for callers that only need a coarse feature location;
+    # they are now derived from the fused points rather than from one arbitrary view.
+    position_of = {li: p for li, p in zip(dense_idx, dense_pts)}
+    out: Dict[str, np.ndarray] = {}
+    for name, idxs in groups.items():
+        pts = [position_of[li] for li in idxs if li in position_of]
         if pts:
             out[name] = np.mean(pts, axis=0).astype(np.float32)
 
-    return out if len(out) >= 3 else None
+    return FaceLandmarks(groups=out, dense_indices=dense_indices, dense_points=dense_points)
+
+
+def locate_face_landmarks_3d(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    center: np.ndarray,
+    radius: float,
+    vertex_colors: Optional[np.ndarray] = None,
+    num_angles: int = 24,
+    image_size: int = 512,
+) -> Optional[Dict[str, np.ndarray]]:
+    """Feature-group centroids only. Thin wrapper kept for callers that predate
+    `detect_face_landmarks`."""
+    found = detect_face_landmarks(vertices, faces, center, radius, vertex_colors,
+                                  num_angles, image_size)
+    if found is None or len(found.groups) < 3:
+        return None
+    return found.groups
 
 
 def compute_similarity_transform(src_pts: np.ndarray, tgt_pts: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:

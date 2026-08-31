@@ -80,7 +80,8 @@ class UniRigPipeline:
         faces: np.ndarray,
         uvs: Optional[np.ndarray] = None,
         base_color_texture: Optional[Any] = None,
-        eye_regions: Optional[Any] = None
+        eye_regions: Optional[Any] = None,
+        protected: Optional[np.ndarray] = None
     ) -> Dict[str, np.ndarray]:
         """
         Generates 52 ARKit facial blendshapes via Deformation Transfer.
@@ -91,7 +92,8 @@ class UniRigPipeline:
                 faces=faces,
                 uvs=uvs,
                 base_color_texture=base_color_texture,
-                eye_regions=eye_regions
+                eye_regions=eye_regions,
+                protected=protected
             )
         except Exception as e:
             print(f"[UniRigPipeline] Warning: Facial blendshapes transfer failed: {e}")
@@ -163,7 +165,8 @@ class UniRigPipeline:
             faces=faces,
             uvs=uvs,
             base_color_texture=base_color_texture,
-            eye_regions=eye_regions
+            eye_regions=eye_regions,
+            protected=protected
         ) or {}
 
         if lid_morphs:

@@ -47,7 +47,8 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from .face_parsing import BROW_LABELS, EYE_REGION_LABELS, parse_faces, region_mask
+from .face_parsing import (BROW_LABELS, EYE_REGION_LABELS, FACE_LABELS, parse_faces,
+                           region_mask)
 from .head_views import HeadViewRenderer, View, backproject_pixels, spiral_yaws
 from .mesh_segmentation import HeadRegion, mesh_edges, connected_region
 
@@ -130,6 +131,15 @@ _MAX_EYE_OFFSET = 1.30         # an eye further than this from the head centre i
 _MAX_HEIGHT_MISMATCH = 0.35    # x separation -- a pair of eyes sits level
 _MAX_DEPTH_MISMATCH = 0.40     # x separation -- and equidistant from the head centre
 _MIN_MASK_VERTICES = 8
+
+
+# --- framing the sweep on the face rather than on the head ball -----------------------
+_FACE_BALL_YAWS = (0.0, 45.0, 315.0, 90.0, 270.0)  # enough to find a face, not a sweep
+_FACE_BALL_MIN_VERTICES = 64   # below this the parser did not find a face to frame on
+_FACE_BALL_PERCENTILE = 92.0   # of the distances from the face's centre; a percentile so a
+                               # single stray backprojection cannot restore the old framing
+_FACE_BALL_MARGIN = 1.15       # room around the face, so the parser still sees a portrait
+_FACE_BALL_MAX_FRACTION = 0.95  # only accept a framing that is actually tighter
 _MAX_CONTESTED_FRACTION = 0.25  # of the smaller mask. Below this an overlap is region
                                 # growth bridging two close eyes and is resolved by
                                 # proximity; above it the two "eyes" are the same patch
@@ -588,6 +598,70 @@ def _mask_from_indices(vertex_idx: np.ndarray, n_vertices: int, edges: np.ndarra
     return connected_region(mask, edges, vertices)
 
 
+def _face_ball(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_colors: Optional[np.ndarray],
+    head: HeadRegion,
+    tree: cKDTree,
+    max_dist: float,
+    image_size: int,
+) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Locates the face and returns a (centre, radius) to frame the eye sweep on.
+
+    Every framing in this module is a multiple of `head.radius`, which assumes that ball
+    is a head. It is not reliably one. Measured on two generated characters:
+    `detect_head_region` returned a ball 45.6% of one character's total height -- 90% of
+    its vertices, most of a torso -- and 3.3% of another's, about a quarter of its actual
+    head. It is wrong in both directions, and nothing downstream can correct for it,
+    because a framing constant multiplies whatever it is given.
+
+    What that costs is measurable. Framed on the 45.6% ball the label histogram for one
+    view read cloth=106473, skin=44540: the parser was being shown a body. Both eyes
+    together covered 145x33 pixels of a 768px frame, 938 of which it labelled, and those
+    lifted to 98 vertices for an eye spanning 453. Re-framed at a quarter of that radius
+    the same views labelled 20-47k eye pixels instead.
+
+    So the face is located first, with the same parser, using the labels that survive a
+    bad framing: skin, nose and mouth cover thousands of pixels where an eye covers
+    hundreds. Only the framing is taken from this pass -- every candidate, gate and mask
+    still comes from the main sweep.
+
+    Returns None when no face is found, in which case the caller keeps the head ball.
+    """
+    try:
+        with HeadViewRenderer(vertices, faces, head.center, head.radius,
+                              vertex_colors=vertex_colors, image_size=image_size,
+                              framing=_FRAMING) as renderer:
+            views = [renderer.render(y, 0.0) for y in _FACE_BALL_YAWS]
+            labels, _conf = parse_faces([v.color for v in views])
+    except Exception as e:
+        print(f"[EyeDetection] Could not locate the face for framing: {e}")
+        return None
+
+    hits = np.zeros(len(vertices), dtype=bool)
+    for view, label in zip(views, labels):
+        mask = region_mask(label, FACE_LABELS)
+        if mask.sum() < _MIN_BLOB_PIXELS:
+            continue
+        hits[_lift_blob(view, mask, tree, max_dist)] = True
+
+    if hits.sum() < _FACE_BALL_MIN_VERTICES:
+        return None
+
+    points = vertices[hits]
+    centre = points.mean(axis=0).astype(np.float32)
+    # A percentile, not the maximum: one stray backprojection onto a shoulder would
+    # otherwise put the framing straight back where it started.
+    radius = float(np.percentile(np.linalg.norm(points - centre, axis=1),
+                                 _FACE_BALL_PERCENTILE))
+    radius *= _FACE_BALL_MARGIN
+    if radius <= 0 or radius >= head.radius * _FACE_BALL_MAX_FRACTION:
+        return None
+    return centre, radius
+
+
 def _collect_views(renderer: HeadViewRenderer, yaws: Sequence[float], pitches: Sequence[float],
                    vertices: np.ndarray, tree: cKDTree, max_dist: float,
                    visibility_tol: float,
@@ -647,8 +721,15 @@ def detect_eye_regions(
     tree = cKDTree(vertices)
     yaws = spiral_yaws(yaw_count)
 
+    frame_centre, frame_radius = head.center, head.radius
+    located = _face_ball(vertices, faces, vertex_colors, head, tree, max_dist, image_size)
+    if located is not None:
+        frame_centre, frame_radius = located
+        print(f"[EyeDetection] Framing the sweep on the face: radius {head.radius:.4f} -> "
+              f"{frame_radius:.4f} ({frame_radius / head.radius:.2f}x).")
+
     def sweep(framing: float):
-        with HeadViewRenderer(vertices, faces, head.center, head.radius,
+        with HeadViewRenderer(vertices, faces, frame_centre, frame_radius,
                               vertex_colors=vertex_colors, image_size=image_size,
                               framing=framing) as renderer:
             eyes, brows, vis = _collect_views(
