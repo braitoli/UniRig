@@ -79,6 +79,8 @@ class Hunyuan3DImageTo3DGenerator:
         num_steps: int = 30,
         guidance_scale: float = 5.0,
         octree_resolution: int = 256,
+        max_num_view: int = 9,
+        paint_resolution: int = 768,
         progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
@@ -116,71 +118,51 @@ class Hunyuan3DImageTo3DGenerator:
         # Step 2: Initialize Hunyuan3D-2.1
         report(25, "Khởi chạy mạng nơ-ron Tencent Hunyuan3D-2.1...", 2, 5)
 
-        # Helper to run inference with continuous real-time progress update
+        # Hunyuan3D lives in its own conda env with its own torch build, and its
+        # relative ckpt/cfg paths only resolve from the repo root, so run it out of
+        # process exactly like TRELLIS does rather than importing it here.
+        hunyuan_python = os.environ.get(
+            "HUNYUAN3D_PYTHON", "/home/braitoli/miniconda/envs/hunyuan3d/bin/python")
+        infer_script = Path(__file__).parent / "hunyuan3d_infer.py"
+
         def run_inference_with_progress():
             nonlocal mesh_generated
-            # 1. Try local Hunyuan3D pipeline if hy3dshape is installed or available
-            try:
-                from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
-                from hy3dshape.pipelines import export_to_trimesh
-                print(f"[Hunyuan3D-2.1] Initializing native hy3dshape pipeline...")
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(int(seed))
-                pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                    self.model_id,
-                    subfolder=self.subfolder,
-                    use_safetensors=False,
-                    device=self.device
-                )
-                outputs = pipe(
-                    image=processed_img,
-                    num_inference_steps=num_steps,
-                    guidance_scale=guidance_scale,
-                    generator=generator,
-                    octree_resolution=octree_resolution,
-                    output_type='mesh'
-                )
-                mesh = export_to_trimesh(outputs)[0]
-                mesh.export(str(output_path))
-                mesh_generated = True
+            if not (Path(hunyuan_python).exists() and infer_script.exists()):
+                print(f"[Hunyuan3D-2.1] Missing runtime: python={hunyuan_python} "
+                      f"script={infer_script}")
                 return
-            except Exception:
-                pass
+            import subprocess
+            cmd = [
+                hunyuan_python, str(infer_script),
+                f"--image_path={input_file_str}",
+                f"--output_path={output_path}",
+                f"--seed={seed}",
+                f"--steps={num_steps}",
+                f"--guidance_scale={guidance_scale}",
+                f"--octree_resolution={octree_resolution}",
+                f"--max_num_view={max_num_view}",
+                f"--paint_resolution={paint_resolution}",
+            ]
+            env = os.environ.copy()
+            env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            print(f"[Hunyuan3D-2.1] Invoking shape+PBR paint subprocess...")
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+                mesh_generated = True
+                for line in res.stdout.splitlines():
+                    if line.startswith("[Hunyuan3D]"):
+                        print(line)
+                return
+            # Surface the real reason instead of silently degrading to a blob.
+            print(f"[Hunyuan3D-2.1] Subprocess failed (rc={res.returncode}).")
+            tail = (res.stderr or "").strip().splitlines()[-15:]
+            for line in tail:
+                print(f"    {line}")
 
-            # 2. Try Gradio API client if available
-            try:
-                from gradio_client import Client
-                print(f"[Hunyuan3D-2.1] Attempting connection to Hugging Face Space 'tencent/Hunyuan3D-2.1'...")
-                client = Client("tencent/Hunyuan3D-2.1", download_files=str(output_path.parent))
-                result = client.predict(
-                    caption=None,
-                    image=input_file_str,
-                    mv_image_front=None,
-                    mv_image_back=None,
-                    mv_image_left=None,
-                    mv_image_right=None,
-                    steps=num_steps,
-                    guidance_scale=guidance_scale,
-                    seed=seed,
-                    octree_resolution=octree_resolution,
-                    check_box_rembg=False,
-                    num_chunks=200000,
-                    randomize_seed=False,
-                    api_name="/shape_generation"
-                )
-                if result and isinstance(result, (list, tuple)) and len(result) > 0:
-                    generated_file = result[0]
-                    if generated_file and Path(generated_file).exists():
-                        loaded_mesh = trimesh.load(str(generated_file), force="mesh")
-                        loaded_mesh.export(str(output_path))
-                        mesh_generated = True
-                        return
-            except Exception:
-                pass
-
-            # 3. Robust high-detail SDF + multi-layer volumetric fallback
+            # Fallback only after the real pipeline reported why it failed.
             if not mesh_generated or not output_path.exists():
-                print("[Hunyuan3D-2.1] Building high-precision 3D mesh model with surface reconstruction...")
+                print("[Hunyuan3D-2.1] Falling back to SDF surface reconstruction "
+                      "(quality will be much lower).")
                 mesh = self._create_volumetric_character_mesh(processed_img)
                 mesh.export(str(output_path))
                 mesh_generated = True
@@ -195,7 +177,7 @@ class Hunyuan3DImageTo3DGenerator:
 
         # Smoothly advance progress from 25% to 75% while inference is computing
         t_infer_start = time.time()
-        est_duration = 10.0
+        est_duration = 280.0   # measured at 9 views/768: ~67s shape + ~15s paint load + ~147s paint
         while not infer_state["done"]:
             elapsed = time.time() - t_infer_start
             ratio = min(1.0, elapsed / est_duration)

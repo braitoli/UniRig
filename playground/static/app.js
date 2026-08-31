@@ -20,6 +20,72 @@ let showSkeleton = true;
 let showGrid = true;
 let pollTimer = null;
 
+// ARKit 52 Facial Blendshapes State & Presets
+let currentMorphMeshes = [];
+let currentMorphDictionary = {};
+let activeExpressionPreset = 'neutral';
+// Preset metadata from the server, keyed the same way the buttons are. The clip a button
+// plays is named after the preset, and that name is defined once in
+// pipeline/facial_blendshapes.py -- fetching it keeps the button, the exported clip and the
+// animation dropdown from drifting apart.
+let expressionMeta = {};
+
+const ARKIT_CATEGORIES = {
+  eyes: [
+    "eyeBlinkLeft", "eyeBlinkRight", "eyeWideLeft", "eyeWideRight",
+    "eyeSquintLeft", "eyeSquintRight"
+  ],
+  brows: [
+    "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
+    "eyeLookUpLeft", "eyeLookUpRight", "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft", "eyeLookOutRight"
+  ]
+};
+
+const EXPRESSION_PRESETS = {
+  wink_right: {
+    eyeBlinkRight: 1.0,
+    eyeSquintRight: 0.3
+  },
+  wink_left: {
+    eyeBlinkLeft: 1.0,
+    eyeSquintLeft: 0.3
+  },
+  blink: {
+    eyeBlinkLeft: 1.0,
+    eyeBlinkRight: 1.0
+  },
+  squint: {
+    eyeSquintLeft: 0.85,
+    eyeSquintRight: 0.85
+  },
+  wide: {
+    eyeWideLeft: 1.0,
+    eyeWideRight: 1.0,
+    browInnerUp: 0.7
+  },
+  frown: {
+    browDownLeft: 1.0,
+    browDownRight: 1.0,
+    eyeSquintLeft: 0.5,
+    eyeSquintRight: 0.5
+  },
+  look_up: {
+    eyeLookUpLeft: 0.9,
+    eyeLookUpRight: 0.9,
+    browInnerUp: 0.4
+  },
+  look_left: {
+    eyeLookInRight: 0.85,
+    eyeLookOutLeft: 0.85
+  },
+  look_right: {
+    eyeLookInLeft: 0.85,
+    eyeLookOutRight: 0.85
+  },
+  neutral: {}
+};
+
 // Initialize 3D Scene
 function init3D() {
   const container = document.getElementById('canvas-wrapper');
@@ -581,6 +647,7 @@ async function load3DForStage(stage) {
       });
 
       scene.add(currentMeshGroup);
+      setupMorphTargetsControls(currentMeshGroup);
 
       if (stage === 2 || stage === 3) {
         buildSkeletonVisualizer(currentJobData.metadata?.skel);
@@ -590,8 +657,10 @@ async function load3DForStage(stage) {
       }
     });
   } else if (stage === 4) {
-    // Load Final Rigged and Animated GLB
-    const url = `/api/jobs/${currentJobData.id}/files/rigged_glb`;
+    // Load Final Rigged and Animated GLB. Cache-busted like the JSON fetches above: the URL
+    // never changes when a job is re-animated, so without this the browser keeps replaying
+    // the GLB it downloaded before and the new clips never show up in the picker.
+    const url = `/api/jobs/${currentJobData.id}/files/rigged_glb?_t=${Date.now()}`;
     loader.load(url, (gltf) => {
       currentMeshGroup = gltf.scene;
       currentMeshGroup.position.set(0, 0, 0);
@@ -622,7 +691,7 @@ async function load3DForStage(stage) {
       });
 
       scene.add(currentMeshGroup);
-
+      setupMorphTargetsControls(currentMeshGroup);
 
       // Setup Animation Mixer
       if (gltf.animations && gltf.animations.length > 0) {
@@ -787,11 +856,162 @@ function playAnimation(name) {
   document.getElementById('anim-select').value = name;
 }
 
+// Facial Morph Targets & ARKit Blendshapes Controller
+function setupMorphTargetsControls(meshGroup) {
+  currentMorphMeshes = [];
+  currentMorphDictionary = {};
+
+  if (!meshGroup) return;
+
+  meshGroup.traverse((child) => {
+    if (child.isMesh && child.morphTargetDictionary && child.morphTargetInfluences) {
+      currentMorphMeshes.push(child);
+      Object.assign(currentMorphDictionary, child.morphTargetDictionary);
+    }
+  });
+
+  const countBadge = document.getElementById('blendshape-count-badge');
+  const morphNames = Object.keys(currentMorphDictionary);
+
+  if (morphNames.length === 0) {
+    if (countBadge) countBadge.textContent = '0 Blendshapes';
+    clearMorphSliders();
+    return;
+  }
+
+  if (countBadge) countBadge.textContent = `${morphNames.length} Blendshapes`;
+
+  populateMorphSliders(morphNames);
+  applyExpressionPreset(activeExpressionPreset);
+}
+
+function clearMorphSliders() {
+  ['eyes', 'brows'].forEach(cat => {
+    const list = document.getElementById(`bs-list-${cat}`);
+    if (list) list.innerHTML = '<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 4px;">Chưa có biểu cảm mắt trên model này</div>';
+  });
+}
+
+function populateMorphSliders(availableNames) {
+  const nameSet = new Set(availableNames);
+
+  Object.entries(ARKIT_CATEGORIES).forEach(([cat, targetNames]) => {
+    const list = document.getElementById(`bs-list-${cat}`);
+    if (!list) return;
+
+    const matchedNames = targetNames.filter(name => nameSet.has(name));
+    if (matchedNames.length === 0) {
+      list.innerHTML = '<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 4px;">Không có target khớp</div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    matchedNames.forEach(name => {
+      const row = document.createElement('div');
+      row.className = 'bs-slider-row';
+
+      const label = document.createElement('span');
+      label.className = 'bs-slider-label';
+      label.textContent = name;
+      label.title = name;
+
+      const input = document.createElement('input');
+      input.type = 'range';
+      input.className = 'bs-slider-input';
+      input.min = '0';
+      input.max = '1';
+      input.step = '0.01';
+      input.value = '0';
+      input.dataset.morph = name;
+
+      const valBadge = document.createElement('span');
+      valBadge.className = 'bs-slider-val';
+      valBadge.id = `bs-val-${name}`;
+      valBadge.textContent = '0%';
+
+      input.oninput = (e) => {
+        const val = parseFloat(e.target.value);
+        valBadge.textContent = `${Math.round(val * 100)}%`;
+        setMorphInfluence(name, val);
+        document.querySelectorAll('.expr-btn').forEach(b => b.classList.remove('active'));
+      };
+
+      row.appendChild(label);
+      row.appendChild(input);
+      row.appendChild(valBadge);
+      list.appendChild(row);
+    });
+  });
+}
+
+function setMorphInfluence(name, value) {
+  currentMorphMeshes.forEach(mesh => {
+    if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+      const idx = mesh.morphTargetDictionary[name];
+      if (idx !== undefined && idx < mesh.morphTargetInfluences.length) {
+        mesh.morphTargetInfluences[idx] = value;
+      }
+    }
+  });
+}
+
+async function loadExpressionMeta() {
+  try {
+    const res = await fetch('/api/facial_blendshapes/presets');
+    const data = await res.json();
+    expressionMeta = data.presets || {};
+  } catch (e) {
+    expressionMeta = {};
+  }
+}
+
+// Play an expression as a clip rather than snapping to its pose. The body animation keeps
+// running: this clip only drives morph weights and the body clip only drives bones, so the
+// two do not compete for the same property and neither has to be stopped.
+function playExpressionClip(presetKey) {
+  const meta = expressionMeta[presetKey];
+  const action = meta && currentActions ? currentActions[meta.name] : null;
+  if (!action) return false;
+  action.reset();
+  action.setLoop(THREE.LoopOnce, 1);
+  action.clampWhenFinished = false;
+  action.play();
+  return true;
+}
+
+function applyExpressionPreset(presetKey) {
+  activeExpressionPreset = presetKey;
+  const targetWeights = EXPRESSION_PRESETS[presetKey] || {};
+
+  document.querySelectorAll('.expr-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-preset') === presetKey);
+  });
+
+  // A clip shows the expression happening; the static pose is the fallback for a model
+  // exported before these clips existed, or one whose eyes were never located.
+  if (presetKey !== 'neutral' && playExpressionClip(presetKey)) {
+    return;
+  }
+
+  const allMorphNames = Object.keys(currentMorphDictionary);
+
+  allMorphNames.forEach(name => {
+    const targetVal = targetWeights[name] || 0.0;
+    setMorphInfluence(name, targetVal);
+
+    const slider = document.querySelector(`.bs-slider-input[data-morph="${name}"]`);
+    const valBadge = document.getElementById(`bs-val-${name}`);
+    if (slider) slider.value = targetVal;
+    if (valBadge) valBadge.textContent = `${Math.round(targetVal * 100)}%`;
+  });
+}
+
 // Event Listeners
 document.addEventListener('DOMContentLoaded', () => {
   init3D();
   loadSystemInfo();
   loadHistory();
+  loadExpressionMeta();
 
   // Mode select checkbox initialization & persistence
   const chkAutoFull = document.getElementById('chk-auto-full');
@@ -858,6 +1078,33 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   updateGeneratorUI(selectedGenerator);
 
+  // Generation detail state. Geometry and texture are independent because they cost
+  // very differently -- the texture bake dominates generation time.
+  const selectedDetail = {
+    mesh: localStorage.getItem('unirig_mesh_detail') || 'high',
+    texture: localStorage.getItem('unirig_texture_detail') || 'high',
+  };
+  const detailButtons = document.querySelectorAll('.detail-btn');
+
+  const updateDetailUI = (kind, level) => {
+    selectedDetail[kind] = level;
+    localStorage.setItem(`unirig_${kind}_detail`, level);
+    detailButtons.forEach(btn => {
+      if (btn.getAttribute('data-detail-kind') !== kind) return;
+      btn.classList.toggle('active', btn.getAttribute('data-detail') === level);
+    });
+  };
+
+  detailButtons.forEach(btn => {
+    btn.onclick = () => {
+      const kind = btn.getAttribute('data-detail-kind');
+      const level = btn.getAttribute('data-detail');
+      if (kind && level) updateDetailUI(kind, level);
+    };
+  });
+  updateDetailUI('mesh', selectedDetail.mesh);
+  updateDetailUI('texture', selectedDetail.texture);
+
   // Custom File Upload & Drag-and-Drop
   const uploadZone = document.getElementById('upload-zone');
   const fileInput = document.getElementById('file-input');
@@ -869,6 +1116,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const isAutoFull = document.getElementById('chk-auto-full')?.checked ?? true;
     form.append('mode', isAutoFull ? 'full' : '3d_only');
     form.append('generator', selectedGenerator);
+    form.append('mesh_detail', selectedDetail.mesh);
+    form.append('texture_detail', selectedDetail.texture);
 
     try {
       const res = await fetch('/api/jobs/upload', { method: 'POST', body: form });
@@ -1038,6 +1287,156 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 
+  // Eye Mask Visualizer
+  let eyeMaskVisualizerActive = false;
+  const cachedOriginalMaterials = new Map();
+
+  async function applyEyeMaskHighlight(active) {
+    if (!currentJobData) return;
+
+    if (active && currentStage !== 4 && (currentJobData.status === 'completed' || currentJobData.stage >= 4)) {
+      // Auto switch to Tab 4 Animation 3D which contains full ARKit morph targets
+      await load3DForStage(4);
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (!currentMeshGroup) return;
+
+    let totalEyeVerts = 0;
+    let eyeCenterSum = new THREE.Vector3(0, 0, 0);
+
+    currentMeshGroup.traverse((child) => {
+      if (child.isMesh && child.geometry) {
+        const geo = child.geometry;
+        const count = geo.attributes.position.count;
+
+        if (active) {
+          if (!cachedOriginalMaterials.has(child)) {
+            cachedOriginalMaterials.set(child, child.material);
+          }
+
+          const colors = new Float32Array(count * 3);
+          const dict = child.morphTargetDictionary || {};
+          const morphAttrs = geo.morphAttributes?.position || [];
+
+          // Collect all eye-related morph targets
+          const eyeIndices = [];
+          Object.keys(dict).forEach(name => {
+            if (name.toLowerCase().includes('eye') || name.toLowerCase().includes('blink') || name.toLowerCase().includes('squint')) {
+              const idx = dict[name];
+              if (idx !== undefined && idx < morphAttrs.length) {
+                eyeIndices.push(idx);
+              }
+            }
+          });
+
+          const eyeWeights = new Float32Array(count);
+          if (eyeIndices.length > 0) {
+            eyeIndices.forEach(idx => {
+              const attr = morphAttrs[idx];
+              for (let i = 0; i < count; i++) {
+                const dx = attr.getX(i);
+                const dy = attr.getY(i);
+                const dz = attr.getZ(i);
+                const mag = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (mag > 0.00003) {
+                  eyeWeights[i] = Math.max(eyeWeights[i], Math.min(1.0, mag * 100.0));
+                }
+              }
+            });
+          }
+
+          for (let i = 0; i < count; i++) {
+            const w = eyeWeights[i];
+            if (w > 0.02) {
+              totalEyeVerts++;
+              const px = geo.attributes.position.getX(i);
+              const py = geo.attributes.position.getY(i);
+              const pz = geo.attributes.position.getZ(i);
+              eyeCenterSum.add(new THREE.Vector3(px, py, pz));
+
+              // Bright Radiant Electric Cyan/Neon Green (0, 255, 180)
+              colors[i * 3] = 0.0;                       // R
+              colors[i * 3 + 1] = 0.7 + 0.3 * w;         // G (glowing green/cyan)
+              colors[i * 3 + 2] = 0.95;                  // B (electric cyan)
+            } else {
+              // Dim dark slate for the rest of the body
+              colors[i * 3] = 0.12;
+              colors[i * 3 + 1] = 0.15;
+              colors[i * 3 + 2] = 0.20;
+            }
+          }
+
+          geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+          geo.attributes.color.needsUpdate = true;
+
+          child.material = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            roughness: 0.3,
+            metalness: 0.1,
+            skinning: !!child.isSkinnedMesh,
+            morphTargets: morphAttrs.length > 0,
+            wireframe: wireframeMode
+          });
+          child.material.needsUpdate = true;
+        } else {
+          // Restore original material
+          if (cachedOriginalMaterials.has(child)) {
+            child.material = cachedOriginalMaterials.get(child);
+            cachedOriginalMaterials.delete(child);
+            child.geometry.deleteAttribute('color');
+            child.material.needsUpdate = true;
+          }
+        }
+      }
+    });
+
+    if (active) {
+      if (totalEyeVerts > 0) {
+        const eyeCenter = eyeCenterSum.divideScalar(totalEyeVerts);
+        controls.target.copy(eyeCenter);
+        camera.position.set(eyeCenter.x, eyeCenter.y + 0.05, eyeCenter.z + 0.55);
+        controls.update();
+      }
+      showToast('👁️ Đã bật Mask Vùng Mắt (Màu Xanh Neon). Hãy xem vùng mắt trên khuôn mặt!', 'success');
+    } else {
+      showToast('Đã tắt Mask Vùng Mắt, trở về chế độ hiển thị gốc.', 'info');
+    }
+  }
+
+  function showToast(msg, type = 'info') {
+    let toast = document.getElementById('playground-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'playground-toast';
+      toast.style.cssText = 'position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); z-index: 1000; padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; color: #fff; box-shadow: 0 8px 24px rgba(0,0,0,0.5); backdrop-filter: blur(10px); transition: all 0.3s ease; pointer-events: none; text-align: center;';
+      document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    if (type === 'success') {
+      toast.style.background = 'rgba(16, 185, 129, 0.95)';
+      toast.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+    } else {
+      toast.style.background = 'rgba(15, 23, 42, 0.95)';
+      toast.style.border = '1px solid rgba(59, 130, 246, 0.4)';
+    }
+    toast.style.opacity = '1';
+    toast.style.display = 'block';
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      setTimeout(() => { toast.style.display = 'none'; }, 300);
+    }, 3500);
+  }
+
+  const btnToggleEyeMask = document.getElementById('btn-toggle-eyemask');
+  if (btnToggleEyeMask) {
+    btnToggleEyeMask.onclick = async (e) => {
+      eyeMaskVisualizerActive = !eyeMaskVisualizerActive;
+      btnToggleEyeMask.classList.toggle('active', eyeMaskVisualizerActive);
+      await applyEyeMaskHighlight(eyeMaskVisualizerActive);
+    };
+  }
+
   // Toolbar toggles
   document.getElementById('btn-toggle-wireframe').onclick = (e) => {
     wireframeMode = !wireframeMode;
@@ -1108,4 +1507,20 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.innerHTML = '<i class="fa-solid fa-person-running"></i> Tạo Motion (0.1s)';
     }
   };
+
+  // Facial Expression Presets click handlers
+  document.querySelectorAll('.expr-btn').forEach(btn => {
+    btn.onclick = () => {
+      const preset = btn.getAttribute('data-preset');
+      if (preset) applyExpressionPreset(preset);
+    };
+  });
+
+  // Accordion collapsible categories
+  document.querySelectorAll('.bs-category-header').forEach(hdr => {
+    hdr.onclick = () => {
+      const parent = hdr.closest('.bs-category');
+      if (parent) parent.classList.toggle('collapsed');
+    };
+  });
 });

@@ -12,6 +12,7 @@ from .rig_export import create_rigged_glb
 from .skinning import predict_skin_weights
 from .animation import generate_standard_animations, SkeletonClassifier, assign_anatomical_names
 from .pan_retargeting import generate_pan_retargeted_animations
+from . import detail_presets
 from .trellis_generator import TrellisImageTo3DGenerator
 from .hunyuan3d_generator import Hunyuan3DImageTo3DGenerator
 
@@ -67,6 +68,124 @@ class UniRigPipeline:
             
         self.config_skeleton = self.root_dir / "configs/task/quick_inference_skeleton_articulationxl_ar_256_nofbx.yaml"
         self.python_bin = sys.executable
+        
+        from .facial_blendshapes import FacialBlendshapesTransfer
+        self.facial_blendshapes_transfer = FacialBlendshapesTransfer(
+            assets_dir=str(self.root_dir / "pipeline" / "assets" / "arkit_blendshapes")
+        )
+        
+    def generate_facial_blendshapes(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        uvs: Optional[np.ndarray] = None,
+        base_color_texture: Optional[Any] = None,
+        eye_regions: Optional[Any] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Generates 52 ARKit facial blendshapes via Deformation Transfer.
+        """
+        try:
+            return self.facial_blendshapes_transfer.transfer_blendshapes(
+                vertices=vertices,
+                faces=faces,
+                uvs=uvs,
+                base_color_texture=base_color_texture,
+                eye_regions=eye_regions
+            )
+        except Exception as e:
+            print(f"[UniRigPipeline] Warning: Facial blendshapes transfer failed: {e}")
+            return {}
+
+    def _build_facial_morphs(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        colors: Optional[np.ndarray],
+        uvs: Optional[np.ndarray],
+        normals: Optional[np.ndarray],
+        skin_weights: np.ndarray,
+        base_color_texture: Optional[Any]
+    ):
+        """
+        Locates the eyes, welds an eyelid over each of them, and returns the extended mesh
+        along with its ARKit morph targets.
+
+        The order is not interchangeable. Lids add vertices, and every per-vertex array --
+        colours, UVs, normals, skin weights, and every morph target -- has to match the
+        mesh they belong to in length. So the lids go on first and the ARKit transfer then
+        runs against the mesh that already has them.
+
+        Eye detection is a 16-angle render sweep with a face-parsing pass per view, so it
+        runs once here and the result is handed down rather than recomputed inside the
+        transfer.
+
+        Returns `(vertices, faces, colors, uvs, normals, skin_weights, morph_targets)`.
+        """
+        from .eye_detection import detect_eye_regions
+        from .eyelid_patch import attach_eyelids, merge_morph_targets
+        from .face_landmark_align import sample_vertex_colors
+        from .mesh_segmentation import detect_head_region
+
+        eye_regions = None
+        lid_morphs: Dict[str, np.ndarray] = {}
+        protected = None
+        vertex_colors = None
+        try:
+            head = detect_head_region(vertices, faces)
+            if head is None:
+                print("[UniRigPipeline] No head region detected; no eyelids will be built.")
+            else:
+                vertex_colors = sample_vertex_colors(vertices, faces, uvs, base_color_texture)
+                eye_regions = detect_eye_regions(
+                    vertices, faces, head, vertex_colors=vertex_colors)
+        except Exception as e:
+            print(f"[UniRigPipeline] Eye detection unavailable: {e}")
+
+        if eye_regions is not None:
+            try:
+                lids = attach_eyelids(vertices, faces, eye_regions, colors=colors, uvs=uvs,
+                                      normals=normals, skin_weights=skin_weights,
+                                      appearance=vertex_colors)
+            except Exception as e:
+                print(f"[UniRigPipeline] Eyelid construction failed: {e}")
+                lids = None
+            if lids is not None:
+                vertices, faces = lids.vertices, lids.faces
+                colors, uvs = lids.colors, lids.uvs
+                normals, skin_weights = lids.normals, lids.skin_weights
+                eye_regions = lids.eye_regions
+                lid_morphs = lids.morph_targets
+                protected = lids.protected
+
+        morph_targets = self.generate_facial_blendshapes(
+            vertices=vertices,
+            faces=faces,
+            uvs=uvs,
+            base_color_texture=base_color_texture,
+            eye_regions=eye_regions
+        ) or {}
+
+        if lid_morphs:
+            # Nothing transferred from the ARKit template is allowed to touch the painted
+            # eye, the lids, or the iris caps. A transferred shape lands there by template
+            # alignment and applies a displacement field, which stretches a painted circle
+            # into an ellipse -- the exact defect the iris cap exists to remove. Zeroing the
+            # transfer over that geometry and then summing leaves each shape driven by
+            # whichever source can do it correctly: the patch inside the eye, the transfer
+            # on the brow and forehead around it.
+            if protected is not None:
+                for delta in morph_targets.values():
+                    if len(delta) == len(protected):
+                        delta[protected] = 0.0
+            morph_targets = merge_morph_targets(morph_targets, lid_morphs)
+
+        # `create_rigged_glb` silently drops any target whose length disagrees with the
+        # mesh. That would shift every later target's index and leave the blink track
+        # pointing at the wrong shape, so drop them here, where the ordering is still ours.
+        morph_targets = {k: v for k, v in morph_targets.items() if len(v) == len(vertices)}
+        return vertices, faces, colors, uvs, normals, skin_weights, morph_targets
+
         
     def preprocess_mesh(
         self,
@@ -170,7 +289,11 @@ class UniRigPipeline:
             np.savez(str(root_npz), **raw_data)
         
         norm_glb_path = out_dir / f"{stem}_input.glb"
-        tm.export(str(norm_glb_path), extension_webp=True)
+        try:
+            tm.export(str(norm_glb_path), extension_webp=True)
+        except Exception:
+            tm.export(str(norm_glb_path))
+
 
         return {
             "stem": stem,
@@ -460,10 +583,12 @@ class UniRigPipeline:
         use_neural_pan: bool = False,
         bvh_file_path: Optional[str] = None,
         base_color_texture: Optional[Any] = None,
-        metallic_roughness_texture: Optional[Any] = None
+        metallic_roughness_texture: Optional[Any] = None,
+        morph_targets: Optional[Dict[str, np.ndarray]] = None,
+        enable_facial_blendshapes: bool = True
     ) -> Dict[str, Any]:
         """
-        Step 4: Generate retargeted animations and build complete rigged & animated GLB.
+        Step 4: Generate retargeted animations, transfer facial blendshapes, and build complete rigged & animated GLB.
         """
         t0 = time.time()
         if use_neural_pan:
@@ -485,7 +610,37 @@ class UniRigPipeline:
         else:
             from .animation import generate_standard_animations
             animations = generate_standard_animations(joints, parents)
-        
+            
+        # Automatically generate 52 ARKit facial blendshapes if requested and not provided.
+        # This can grow the mesh: an eyelid is added over each detected eye, because the
+        # generated characters carry their eyes as paint on a closed surface and there is
+        # no lid to move otherwise.
+        if morph_targets is None and enable_facial_blendshapes:
+            vertices, faces, colors, uvs, normals, skin_weights, morph_targets = (
+                self._build_facial_morphs(vertices, faces, colors, uvs, normals,
+                                          skin_weights, base_color_texture)
+            )
+
+        # Bake the blinking in rather than leaving it to the consuming application: a GLB
+        # that blinks on its own looks alive in any viewer, including the r128 Three.js one
+        # in playground/, with no runtime code on the other side.
+        if morph_targets:
+            from .animation import generate_blink_animation, generate_expression_animations
+            names = list(morph_targets.keys())
+            extra = {}
+            blink = generate_blink_animation(names)
+            if blink is not None:
+                extra["Blink"] = blink
+            # Every eye expression also ships as its own clip. A morph target on its own is
+            # a pose: it says what the face should look like but nothing about how it gets
+            # there, and an application that just sets the weight produces a jump cut.
+            extra.update(generate_expression_animations(names))
+            if extra:
+                animations = {**animations, **extra}
+                print(f"[UniRigPipeline] Added {len(extra)} facial clips: "
+                      f"{', '.join(extra)}.")
+
+
         glb_bytes = create_rigged_glb(
             vertices=vertices,
             faces=faces,
@@ -499,15 +654,16 @@ class UniRigPipeline:
             animations=animations,
             output_path=output_glb_path,
             base_color_texture=base_color_texture,
-            metallic_roughness_texture=metallic_roughness_texture
+            metallic_roughness_texture=metallic_roughness_texture,
+            morph_targets=morph_targets
         )
         t1 = time.time()
 
-        
         return {
             "glb_path": output_glb_path,
             "glb_size_bytes": len(glb_bytes),
             "animations": list(animations.keys()),
+            "blendshapes": list(morph_targets.keys()) if morph_targets else [],
             "export_time_sec": round(t1 - t0, 2)
         }
 
@@ -517,10 +673,16 @@ class UniRigPipeline:
         output_dir: str,
         seed: int = 42,
         generator_type: str = "trellis",
+        mesh_detail: Optional[str] = None,
+        texture_detail: Optional[str] = None,
         progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         Stage 0: Generates a 3D model (.glb) from a 2D image using TRELLIS.2-4B or Tencent Hunyuan3D-2.1.
+
+        mesh_detail and texture_detail are "preview" / "standard" / "high"; both default to
+        "high", which is what this stage ran at before the levels existed. See
+        pipeline/detail_presets.py for what each level costs.
         """
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -537,8 +699,11 @@ class UniRigPipeline:
             image_input=image_path,
             output_glb_path=output_glb_path,
             seed=seed,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
         )
+        res["mesh_detail"] = detail_presets.normalize(mesh_detail)
+        res["texture_detail"] = detail_presets.normalize(texture_detail)
         return res
 
     def run_full_pipeline(
@@ -548,6 +713,8 @@ class UniRigPipeline:
         work_dir: str,
         generator_type: str = "trellis",
         seed: int = 42,
+        mesh_detail: Optional[str] = None,
+        texture_detail: Optional[str] = None,
         progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
@@ -571,6 +738,8 @@ class UniRigPipeline:
                 output_dir=str(stage0_dir),
                 seed=seed,
                 generator_type=generator_type,
+                mesh_detail=mesh_detail,
+                texture_detail=texture_detail,
                 progress_callback=progress_callback
             )
             current_3d_input = stage0_res["output_glb_path"]

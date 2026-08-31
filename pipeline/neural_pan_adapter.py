@@ -9,7 +9,9 @@ PAN_DIR = Path(__file__).resolve().parent.parent / "external" / "pan-motion-reta
 if str(PAN_DIR) not in sys.path:
     sys.path.insert(0, str(PAN_DIR))
 
-from pipeline.animation import SkeletonClassifier, euler_to_quat, quat_multiply
+from pipeline.animation import (SkeletonClassifier, euler_to_quat, quat_multiply,
+                                generate_head_gesture_animations,
+                                resolve_named_roles, hierarchy_depths)
 from outer_utils import BVH
 from outer_utils.Animation import positions_global
 
@@ -34,12 +36,89 @@ def quat_mult_batch(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(res, axis=-1, keepdims=True)
     return res / (norms + 1e-9)
 
+def _hierarchy_order(parents: List[Optional[int]]) -> List[int]:
+    """Joint indices ordered so that a parent always comes before its children."""
+    depths = hierarchy_depths(parents)
+    return sorted(range(len(parents)), key=lambda j: depths[j])
+
+
+def _world_quats(local_q: np.ndarray, parents: List[Optional[int]]) -> np.ndarray:
+    """Compose parent-local rotations (T, J, 4) xyzw into world rotations."""
+    world = np.zeros_like(local_q)
+    world[..., 3] = 1.0
+    for j in _hierarchy_order(parents):
+        p = parents[j]
+        world[:, j] = local_q[:, j] if p is None else quat_mult_batch(world[:, p], local_q[:, j])
+    return world
+
+
+def _mean_world_quat(world: np.ndarray) -> np.ndarray:
+    """
+    Average world rotation of each joint over the clip, shape (T, J, 4) -> (1, J, 4).
+
+    This is the reference pose the transfer is measured against, and it has to be a neutral
+    one. Frame 0 is not: a gait cycle catches the two legs half a cycle apart, so zeroing
+    each joint there offsets the left leg's swing backwards and the right leg's forwards, and
+    the character walks with one leg leading and the other trailing. Averaging a whole cycle
+    cancels that. The clip's own bind pose is no use either -- LaFAN1's lays the entire
+    skeleton along X rather than standing it up.
+
+    Signs are aligned to frame 0 first, since q and -q are the same rotation and averaging
+    them raw cancels to nothing.
+    """
+    ref = world[0:1]
+    aligned = np.where(np.sum(world * ref, axis=-1, keepdims=True) < 0.0, -world, world)
+    mean = aligned.mean(axis=0, keepdims=True)
+    return mean / (np.linalg.norm(mean, axis=-1, keepdims=True) + 1e-9)
+
+
+def _order_sides_by_x(left: List[List[int]], right: List[List[int]],
+                      bind_pos: np.ndarray, lr_axis: int) -> Tuple[List[List[int]], List[List[int]]]:
+    """
+    Relabel a left/right pair of limb branch sets by which side sits at the smaller X.
+
+    SkeletonClassifier names whichever limb is at smaller X the "left" one regardless of
+    anatomy, and the target is always classified that way. Bone names carry real anatomy, so
+    named source roles are relabelled to the same convention before pairing -- otherwise a
+    +Z-facing source (whose anatomical left is at +X) hands its left arm to the target's
+    right. This only reconciles the two naming conventions; it does not turn anyone round.
+    """
+    def mean_x(branches: List[List[int]]) -> float:
+        vals = [float(np.mean(bind_pos[b, lr_axis])) for b in branches if b]
+        return float(np.mean(vals)) if vals else 0.0
+
+    if left and right and mean_x(left) > mean_x(right):
+        return right, left
+    return left, right
+
+
+def _scale_quat_angle(q: np.ndarray, scale: float) -> np.ndarray:
+    """Scale the rotation angle of each quaternion in (T, 4), keeping its axis."""
+    # q and -q are the same rotation; force w >= 0 so `angle` is the short arc (0..pi).
+    # Without this a quaternion stored with w < 0 reads as angle > pi and scaling it spins
+    # the joint the wrong way.
+    q = np.where(q[:, 3:4] < 0.0, -q, q)
+    w = np.clip(q[:, 3], -1.0, 1.0)
+    angle = 2.0 * np.arccos(w)
+    sin_half = np.sqrt(np.maximum(0.0, 1.0 - w * w)) + 1e-9
+    axis = q[:, :3] / sin_half[:, None]
+
+    # Clamp instead of letting the angle run past pi: a quaternion cannot represent more
+    # than a half turn, so an unclamped scale wraps around and reverses the joint
+    # (120deg x 2.5 = 300deg comes back as 60deg the other way).
+    scaled = np.minimum(angle * scale, np.pi)
+    res = np.column_stack([axis * np.sin(scaled * 0.5)[:, None], np.cos(scaled * 0.5)])
+    return res / (np.linalg.norm(res, axis=-1, keepdims=True) + 1e-9)
+
+
 class MocapDrivenRetargeter:
     """
     Retargets real Mixamo/Lafan1 mocap BVH clips onto UniRig predicted skeletons.
-    Both skeletons are structurally classified (root/spine/limb roles) via SkeletonClassifier
-    and mapped role-to-role, since UniRig joint names (bone_0, bone_1, ...) never match
-    Mixamo bone names. Rotation deltas are amplified for dynamic walking/running strides.
+
+    The two skeletons are matched role to role -- root, spine, limb branches -- because
+    UniRig joint names (bone_0, bone_1, ...) never match a mocap rig's. Source roles come
+    from its bone names when it has real ones, and from geometry otherwise; the target is
+    always classified geometrically.
     """
     def __init__(self, joints: np.ndarray, parents: List[Optional[int]]):
         self.joints = joints.astype(np.float32)
@@ -54,18 +133,20 @@ class MocapDrivenRetargeter:
         bvh_file_path: str,
         fps: int = 30,
         max_duration: float = 4.0,
-        leg_amp: float = 2.2,
-        arm_amp: float = 1.8
+        leg_amp: float = 1.0,
+        arm_amp: float = 1.0,
+        cycle_duration: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Retargets a real Mixamo Mocap BVH clip onto the target UniRig predicted skeleton topology
-        with amplified leg stride and arm swing for natural, high-amplitude walking and running.
+        Retargets a real Mixamo Mocap BVH clip onto the target UniRig predicted skeleton
+        topology. Amplification defaults to 1.0, transferring the captured performance as
+        recorded.
         """
         bvh_path = Path(bvh_file_path)
         if not bvh_path.exists():
             raise FileNotFoundError(f"Mixamo BVH file not found: {bvh_path}")
 
-        anim, _names, frametime = BVH.load(str(bvh_path))
+        anim, names, frametime = BVH.load(str(bvh_path))
         # Classify the source off its average pose, not frame 0: frame 0 of a locomotion clip
         # catches the actor mid-stride with a foot in the air, and a raised foot fails the
         # "reaches the floor" test, so that leg gets read as a tail and never drives anything.
@@ -86,7 +167,8 @@ class MocapDrivenRetargeter:
 
         return self._retarget_from_source(
             bvh_bind_pos, bvh_parents, qs_gltf, pos_bvh,
-            fps=fps, leg_amp=leg_amp, arm_amp=arm_amp
+            fps=fps, leg_amp=leg_amp, arm_amp=arm_amp,
+            src_names=list(names), cycle_duration=cycle_duration
         )
 
     def retarget_npz_clip(
@@ -94,7 +176,8 @@ class MocapDrivenRetargeter:
         npz_file_path: str,
         fps: int = 30,
         leg_amp: float = 1.0,
-        arm_amp: float = 1.0
+        arm_amp: float = 1.0,
+        cycle_duration: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Retargets a pre-extracted mocap clip (Lafan1-and-dog dataset, saved as a small
@@ -114,10 +197,12 @@ class MocapDrivenRetargeter:
         parents_raw = clip["parents"]
         clip_parents = [int(p) if p >= 0 else None for p in parents_raw]
         clip_bind_pos = pos.mean(axis=0)  # (J, 3) world-space rest pose, averaged over the clip
+        names = [str(n) for n in clip["joint_names"]] if "joint_names" in clip else None
 
         return self._retarget_from_source(
             clip_bind_pos, clip_parents, qs_gltf, pos,
-            fps=fps, leg_amp=leg_amp, arm_amp=arm_amp
+            fps=fps, leg_amp=leg_amp, arm_amp=arm_amp,
+            src_names=names, cycle_duration=cycle_duration
         )
 
     def _retarget_from_source(
@@ -127,141 +212,173 @@ class MocapDrivenRetargeter:
         qs_gltf: np.ndarray,
         pos: np.ndarray,
         fps: int = 30,
-        leg_amp: float = 2.2,
-        arm_amp: float = 1.8
+        leg_amp: float = 1.0,
+        arm_amp: float = 1.0,
+        src_names: Optional[List[str]] = None,
+        cycle_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Shared retargeting core: classifies the source skeleton's structural roles the same
-        way the UniRig target skeleton is classified (source bone names never match UniRig's
-        generic joint names), maps role-to-role, and produces amplified rotation/translation
-        tracks. Used by both retarget_mixamo_bvh and retarget_npz_clip.
+        Shared retargeting core, used by both retarget_mixamo_bvh and retarget_npz_clip.
+
+        Motion crosses over in WORLD space: the source joint's world-space rotation change
+        since its own first frame is applied to the target's rest orientation, then converted
+        back into the target's parent-local frame for the glTF track. Copying the source's
+        parent-local delta straight across (what this did before) assumes both skeletons
+        express a joint's rotation in the same frame, and they do not -- LaFAN1's hip sits
+        173.8 degrees from identity at its clip's first frame, so "swing the leg forward"
+        arrived at the target as very nearly "swing it backward". The giveaway was that
+        retargeting a clip onto its own skeleton failed to reproduce the clip.
         """
-        src_classifier = SkeletonClassifier(src_bind_pos, src_parents)
+        src_roles = resolve_named_roles(src_names, src_parents) \
+            or SkeletonClassifier(src_bind_pos, src_parents)
+        # Named roles are anatomical; the target's are geometric. Align the two conventions
+        # before anything is paired.
+        src_roles.left_leg_branches, src_roles.right_leg_branches = _order_sides_by_x(
+            src_roles.left_leg_branches, src_roles.right_leg_branches,
+            src_bind_pos, src_roles.lr_axis)
+        src_roles.left_arm_branches, src_roles.right_arm_branches = _order_sides_by_x(
+            src_roles.left_arm_branches, src_roles.right_arm_branches,
+            src_bind_pos, src_roles.lr_axis)
+        tgt = self.classifier
 
         num_frames = qs_gltf.shape[0]
-        duration = num_frames / fps
-        times = np.linspace(0.0, duration, num_frames, dtype=np.float32)
+        duration = float(cycle_duration) if cycle_duration else num_frames / fps
+        # Frames are spaced duration/num_frames, not duration/(num_frames - 1). These clips
+        # are cycles: the frame after the last one is the first one again, so the last
+        # keyframe belongs one interval short of the end. Spreading the samples to land on
+        # `duration` instead stretched every clip by a frame, and left the loop no interval
+        # to wrap across.
+        frame_dt = duration / num_frames
+        times = (np.arange(num_frames, dtype=np.float32) * frame_dt).astype(np.float32)
 
-        root_pos = pos[:, 0, :]  # (T, 3)
+        # World rotation of every source joint, and how far it has turned away from the
+        # clip's own neutral pose. The same average pose the roles are classified against.
+        world_src = _world_quats(qs_gltf, src_parents)
+        src_delta = quat_mult_batch(world_src, quat_inv_batch(_mean_world_quat(world_src)))
 
-        # Calculate UniRig target skeleton height
-        j_span = self.joints.max(axis=0) - self.joints.min(axis=0)
-        skel_height = j_span[self.classifier.up_axis] + 1e-6
+        # A target that faces away from the source ought to have this motion turned a half
+        # circle about the vertical (and its limb sides swapped) or it strides backwards.
+        # That is deliberately NOT done, because nothing available here can say reliably WHICH
+        # characters need it: across the cached corpus the three usable facing cues -- toe
+        # ahead of ankle, foot mesh extent, head mesh extent -- disagree with each other more
+        # often than they agree, and on the one character whose facing the repo's own eye
+        # detector could establish, the skeleton cue had it backwards. Turning characters
+        # round on a signal that unreliable is worse than never turning one. Feeding
+        # detect_eye_regions().forward in here would settle it.
 
-        tracks = []
-        root_idx = self.classifier.root_idx
-        root_orig_trans = self.joints[root_idx]
-
-        # Root bounce from the mocap stride, expressed as a fraction of the source's own
-        # height so it transfers at the target's scale. The previous fixed 0.02 factor
-        # multiplied LaFAN1's centimetres directly and slid the root several body heights.
-        # Only the vertical component is kept: these are looping cycles, and the source's
-        # horizontal path is per-frame yaw-normalised rather than a straight line, so
-        # carrying it over just drags the character sideways and pops on every repeat.
-        src_span = src_bind_pos.max(axis=0) - src_bind_pos.min(axis=0)
-        src_height = src_span[1] + 1e-6
-        src_disp = root_pos - root_pos[0:1, :]
-        root_trans = np.tile(root_orig_trans, (num_frames, 1))
-        root_trans[:, self.classifier.up_axis] += (skel_height / src_height) * src_disp[:, 1]
-
-        tracks.append({"joint_idx": root_idx, "path": "translation", "times": times, "values": root_trans})
-
-        # Computes amplified local delta quaternion: q_delta(t) = q(0)^(-1) * q(t)
-        # Scaled along axis by scale_amp
-        def get_bvh_scaled_delta_quat(idx: int, scale_amp: float = 1.0) -> np.ndarray:
-            q_t = qs_gltf[:, idx, :] # (T, 4)
-            q_0 = q_t[0:1, :]       # (1, 4)
-            q_0_inv = quat_inv_batch(q_0)
-            q_delta = quat_mult_batch(q_0_inv, q_t) # Local delta from frame 0
-            
-            if abs(scale_amp - 1.0) < 1e-3:
-                return q_delta
-
-            # q and -q are the same rotation; force w >= 0 so `angle` is the short arc
-            # (0..pi). Without this a delta stored with w < 0 reads as angle > pi and
-            # scaling it spins the joint the wrong way.
-            q_delta = np.where(q_delta[:, 3:4] < 0.0, -q_delta, q_delta)
-
-            w = np.clip(q_delta[:, 3], -1.0, 1.0)
-            angle = 2.0 * np.arccos(w) # Angle in radians
-            sin_half = np.sqrt(np.maximum(0.0, 1.0 - w*w)) + 1e-9
-            axis = q_delta[:, :3] / sin_half[:, None]
-
-            # Clamp instead of letting the angle run past pi: a quaternion cannot represent
-            # more than a half turn, so an unclamped scale wraps around and reverses the
-            # joint (120deg x 2.5 = 300deg comes back as 60deg the other way).
-            scaled_angle = np.minimum(angle * scale_amp, np.pi)
-            scaled_w = np.cos(scaled_angle * 0.5)
-            scaled_sin = np.sin(scaled_angle * 0.5)
-            scaled_xyz = axis * scaled_sin[:, None]
-            
-            res = np.column_stack([scaled_xyz, scaled_w])
-            norms = np.linalg.norm(res, axis=-1, keepdims=True)
-            return res / (norms + 1e-9)
-
-        def branch_joint_idx(bvh_branches: List[List[int]], b_idx: int, seg_idx: int) -> Optional[int]:
-            """Looks up the BVH joint index for the b_idx-th limb branch's seg_idx-th
-            segment (0=thigh/shoulder, 1=knee/elbow, 2+=ankle/hand), clamped to what the
-            BVH source skeleton actually has."""
-            if not bvh_branches:
+        def branch_joint_idx(branches: List[List[int]], b_idx: int, seg_idx: int) -> Optional[int]:
+            """Looks up the source joint for the b_idx-th limb branch's seg_idx-th segment
+            (0=thigh/shoulder, 1=knee/elbow, 2+=ankle/hand), clamped to what the source
+            skeleton actually has."""
+            if not branches:
                 return None
-            branch = bvh_branches[min(b_idx, len(bvh_branches) - 1)]
+            branch = branches[min(b_idx, len(branches) - 1)]
             if not branch:
                 return None
             return branch[min(seg_idx, len(branch) - 1)]
 
-        # Spine mapping
-        src_spine = src_classifier.spine_chain
-        for i, s_idx in enumerate(self.classifier.spine_chain):
-            if not src_spine:
+        # ---- target joint -> source joint ------------------------------------------------
+        pairs: Dict[int, int] = {}
+
+        # Sample the source spine by normalised position so BOTH ends stay anchored: the
+        # target's last spine joint always receives the source's head. Indexing from the root
+        # and clamping (the previous rule) handed the head whichever source joint sat at the
+        # same depth -- the chest on a four-joint spine, and on a longer one Mixamo's hair
+        # bone, which does not rotate at all.
+        src_spine, tgt_spine = src_roles.spine_chain, tgt.spine_chain
+        if src_spine and tgt_spine:
+            span = len(tgt_spine) - 1
+            for i, joint in enumerate(tgt_spine):
+                frac = 0.0 if span == 0 else i / span
+                pairs[joint] = src_spine[int(round(frac * (len(src_spine) - 1)))]
+
+        # Leg branches are ordered along the forward axis so a quadruped's front legs meet
+        # front legs rather than hind ones.
+        tgt_left_legs = sorted(tgt.left_leg_branches, key=lambda b: self.joints[b[0]][tgt.fw_axis])
+        tgt_right_legs = sorted(tgt.right_leg_branches, key=lambda b: self.joints[b[0]][tgt.fw_axis])
+        src_left_legs = sorted(src_roles.left_leg_branches,
+                               key=lambda b: src_bind_pos[b[0]][src_roles.fw_axis])
+        src_right_legs = sorted(src_roles.right_leg_branches,
+                                key=lambda b: src_bind_pos[b[0]][src_roles.fw_axis])
+        src_left_arms = list(src_roles.left_arm_branches)
+        src_right_arms = list(src_roles.right_arm_branches)
+
+        limb_pairs = (
+            (tgt_left_legs, src_left_legs),
+            (tgt_right_legs, src_right_legs),
+            (list(tgt.left_arm_branches), src_left_arms),
+            (list(tgt.right_arm_branches), src_right_arms),
+        )
+        for tgt_branches, src_branches in limb_pairs:
+            for b_idx, branch in enumerate(tgt_branches):
+                for seg_idx, joint in enumerate(branch):
+                    src_idx = branch_joint_idx(src_branches, b_idx, seg_idx)
+                    if src_idx is not None:
+                        pairs[joint] = src_idx
+
+        # Optional per-limb exaggeration. Left at 1.0 the source mocap transfers untouched,
+        # which is the point of using mocap; the old hard-coded 1.2x on knees and spine was
+        # compensating for the frame mismatch fixed above.
+        amp: Dict[int, float] = {}
+        for branches, value in ((tgt_left_legs + tgt_right_legs, leg_amp),
+                                (list(tgt.left_arm_branches) + list(tgt.right_arm_branches), arm_amp)):
+            if abs(value - 1.0) < 1e-3:
                 continue
-            src_idx = src_spine[min(i, len(src_spine) - 1)]
-            rot_vals = get_bvh_scaled_delta_quat(src_idx, scale_amp=1.2)
-            tracks.append({"joint_idx": s_idx, "path": "rotation", "times": times, "values": rot_vals})
+            for branch in branches:
+                for joint in branch:
+                    amp[joint] = value
 
-        # Left Legs mapping (Amplified leg swing & deep knee flex)
-        left_branches_sorted = sorted(self.classifier.left_leg_branches, key=lambda b: self.joints[b[0]][self.classifier.fw_axis])
-        src_left_legs = sorted(src_classifier.left_leg_branches, key=lambda b: src_bind_pos[b[0]][src_classifier.fw_axis])
-        for b_idx, branch in enumerate(left_branches_sorted):
-            for idx, leg_j in enumerate(branch):
-                seg_amp = leg_amp * 1.2 if idx == 1 else leg_amp  # deeper knee flex
-                src_idx = branch_joint_idx(src_left_legs, b_idx, idx)
-                if src_idx is None:
-                    continue
-                rot = get_bvh_scaled_delta_quat(src_idx, scale_amp=seg_amp)
-                tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot})
+        # ---- world rotations on the target, then back to parent-local --------------------
+        # The target's rest orientation is identity (rig_export writes every node with
+        # rotation [0,0,0,1]), so its world rotation IS the source's world delta.
+        world_tgt = np.zeros((num_frames, self.J, 4), dtype=np.float32)
+        world_tgt[..., 3] = 1.0
+        for joint in _hierarchy_order(self.parents):
+            parent = self.parents[joint]
+            src_idx = pairs.get(joint)
+            if src_idx is None:
+                # Unmapped joints ride along with their parent, i.e. local rotation identity.
+                if parent is not None:
+                    world_tgt[:, joint] = world_tgt[:, parent]
+                continue
+            delta = src_delta[:, src_idx, :]
+            scale = amp.get(joint)
+            if scale:
+                delta = _scale_quat_angle(delta, scale)
+            world_tgt[:, joint] = delta
 
-        # Right Legs mapping (Amplified leg swing & deep knee flex)
-        right_branches_sorted = sorted(self.classifier.right_leg_branches, key=lambda b: self.joints[b[0]][self.classifier.fw_axis])
-        src_right_legs = sorted(src_classifier.right_leg_branches, key=lambda b: src_bind_pos[b[0]][src_classifier.fw_axis])
-        for b_idx, branch in enumerate(right_branches_sorted):
-            for idx, leg_j in enumerate(branch):
-                seg_amp = leg_amp * 1.2 if idx == 1 else leg_amp
-                src_idx = branch_joint_idx(src_right_legs, b_idx, idx)
-                if src_idx is None:
-                    continue
-                rot = get_bvh_scaled_delta_quat(src_idx, scale_amp=seg_amp)
-                tracks.append({"joint_idx": leg_j, "path": "rotation", "times": times, "values": rot})
+        # Kept so the role mapping can be asserted directly rather than inferred from the
+        # baked curves -- scripts/verify_retarget.py checks that the target's head really is
+        # paired with the source's head.
+        self.last_pairs = dict(pairs)
+        self.last_src_roles = src_roles
 
-        # Left Arm mapping
-        src_left_arms = src_classifier.left_arm_branches
-        for b_idx, branch in enumerate(self.classifier.left_arm_branches):
-            for idx, arm_j in enumerate(branch):
-                src_idx = branch_joint_idx(src_left_arms, b_idx, idx)
-                if src_idx is None:
-                    continue
-                rot = get_bvh_scaled_delta_quat(src_idx, scale_amp=arm_amp)
-                tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot})
+        tracks = []
 
-        # Right Arm mapping
-        src_right_arms = src_classifier.right_arm_branches
-        for b_idx, branch in enumerate(self.classifier.right_arm_branches):
-            for idx, arm_j in enumerate(branch):
-                src_idx = branch_joint_idx(src_right_arms, b_idx, idx)
-                if src_idx is None:
-                    continue
-                rot = get_bvh_scaled_delta_quat(src_idx, scale_amp=arm_amp)
-                tracks.append({"joint_idx": arm_j, "path": "rotation", "times": times, "values": rot})
+        # Root bounce from the mocap stride, expressed as a fraction of the source's own
+        # height so it transfers at the target's scale. Only the vertical component is kept:
+        # these are looping cycles, and the source's horizontal path is per-frame
+        # yaw-normalised rather than a straight line, so carrying it over just drags the
+        # character sideways and pops on every repeat.
+        root_idx = tgt.root_idx
+        j_span = self.joints.max(axis=0) - self.joints.min(axis=0)
+        skel_height = j_span[tgt.up_axis] + 1e-6
+        src_span = src_bind_pos.max(axis=0) - src_bind_pos.min(axis=0)
+        src_height = src_span[1] + 1e-6
+        src_disp = pos[:, 0, :] - pos[0:1, 0, :]
+        root_trans = np.tile(self.joints[root_idx], (num_frames, 1)).astype(np.float32)
+        root_trans[:, tgt.up_axis] += (skel_height / src_height) * src_disp[:, 1]
+        tracks.append({"joint_idx": root_idx, "path": "translation",
+                       "times": times, "values": root_trans})
+
+        for joint in sorted(pairs):
+            parent = self.parents[joint]
+            if parent is None:
+                local = world_tgt[:, joint]
+            else:
+                local = quat_mult_batch(quat_inv_batch(world_tgt[:, parent]), world_tgt[:, joint])
+            tracks.append({"joint_idx": joint, "path": "rotation",
+                           "times": times, "values": local.astype(np.float32)})
 
         return {"duration": duration, "tracks": tracks}
 
@@ -289,16 +406,25 @@ def generate_neural_pan_animations(
     is_quadruped = len(retargeter.classifier.left_leg_branches) >= 2 and len(retargeter.classifier.right_leg_branches) >= 2
     if is_quadruped:
         from pipeline.pan_retargeting import generate_pan_retargeted_animations
-        return generate_pan_retargeted_animations(joints, parents, fps=fps)
+        animations = generate_pan_retargeted_animations(joints, parents, fps=fps)
+        animations.update(generate_head_gesture_animations(joints, parents, fps=fps))
+        return animations
 
     # Walk/Run come from continuous locomotion mocap (LaFAN1), cut to a single gait cycle so
     # the clip loops without popping -- see scratch/extract_human_locomotion_presets.py. The
     # Mixamo clips are one-shot performances: "Catwalk Walk.bvh" is a runway walk that turns
     # around mid-clip, so it neither loops nor travels in a straight line.
-    for anim_name, npz_filename in [("Walk", "Human_Walk.npz"), ("Run", "Human_Run.npz")]:
+    #
+    # Walk is retimed. The captured cycle runs 1.667s, a 72 steps/min amble at roughly
+    # 0.67 m/s; people walk at 100-120 steps/min. Only the playback clock changes, so the
+    # stride keeps its captured shape and proportion (0.71 body heights per cycle) and lands
+    # at a natural speed. Run was captured at 157 steps/min and is already right.
+    locomotion = [("Walk", "Human_Walk.npz", 1.1), ("Run", "Human_Run.npz", None)]
+    for anim_name, npz_filename, cycle in locomotion:
         npz_path = dog_dir / npz_filename
         if npz_path.exists():
-            animations[anim_name] = retargeter.retarget_npz_clip(str(npz_path), fps=fps)
+            animations[anim_name] = retargeter.retarget_npz_clip(
+                str(npz_path), fps=fps, cycle_duration=cycle)
 
     # (animation key, source BVH filename, leg amplification, arm amplification, fallback preset)
     # Amplification stays at 1.0: the source clips are real human mocap, so a 1:1 transfer
@@ -329,5 +455,9 @@ def generate_neural_pan_animations(
         else:
             from pipeline.pan_retargeting import PANMotionRetargeter
             animations[anim_name] = PANMotionRetargeter(joints, parents).retarget_motion(fallback_preset)
+
+    # Head gestures are generated rather than retargeted -- see
+    # generate_head_gesture_animations for why mocap is the wrong source for these two.
+    animations.update(generate_head_gesture_animations(joints, parents, fps=fps))
 
     return animations

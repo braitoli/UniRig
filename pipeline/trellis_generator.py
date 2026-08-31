@@ -104,6 +104,11 @@ class TrellisImageTo3DGenerator:
         output_glb_path: str,
         seed: int = 42,
         decimate_target: int = 300000,
+        resolution: str = "1024",
+        texture_size: int = 4096,
+        tex_slat_steps: int = 30,
+        sparse_structure_steps: int = 12,
+        shape_slat_steps: int = 12,
         progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
@@ -161,9 +166,12 @@ class TrellisImageTo3DGenerator:
                             "image_path": str(input_file_str),
                             "output_path": str(output_path),
                             "seed": seed,
-                            "resolution": "1024",
+                            "resolution": resolution,
                             "decimation_target": min(decimate_target, 300000) if decimate_target else 300000,
-                            "texture_size": 4096
+                            "texture_size": texture_size,
+                            "tex_slat_steps": tex_slat_steps,
+                            "sparse_structure_steps": sparse_structure_steps,
+                            "shape_slat_steps": shape_slat_steps
                         }
                         # Must exceed worst-case bake time (texture_size=4096 measured at ~360s,
                         # slower when the GPU is shared); a premature timeout drops us onto the
@@ -183,7 +191,12 @@ class TrellisImageTo3DGenerator:
                 w_thread.start()
 
                 t_w_start = time.time()
-                est_duration = 360.0
+                # Two terms, because the two detail knobs pay for different things: the
+                # flow-matching pass scales with the grid, the PBR bake with texture area.
+                # A single 360s constant was calibrated for 1024/4096, and left a preview
+                # run sitting at 25% for its whole life.
+                est_duration = (120.0 if str(resolution) == "512" else 240.0) \
+                    + 360.0 * (texture_size / 4096.0) ** 2
                 while not call_state["done"]:
                     elapsed = time.time() - t_w_start
                     ratio = min(1.0, elapsed / est_duration)
@@ -214,8 +227,14 @@ class TrellisImageTo3DGenerator:
                     f"--image_path={input_file_str}",
                     f"--output_path={output_path}",
                     f"--seed={seed}",
-                    f"--resolution=1024",
+                    f"--resolution={resolution}",
                     f"--decimation_target={min(decimate_target, 300000) if decimate_target else 300000}",
+                    # Passed explicitly now: leaving it off meant this fallback path baked at
+                    # trellis2_infer's own 4096 default whatever the worker path was asked for.
+                    f"--texture_size={texture_size}",
+                    f"--tex_slat_steps={tex_slat_steps}",
+                    f"--sparse_structure_steps={sparse_structure_steps}",
+                    f"--shape_slat_steps={shape_slat_steps}",
                 ]
                 env = os.environ.copy()
                 env["PATH"] = f"/home/braitoli/miniconda/envs/trellis/bin:{env.get('PATH', '')}"

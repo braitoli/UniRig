@@ -12,5 +12,8 @@ flash_attn
 trimesh
 open3d
 pyrender
+PyOpenGL-accelerate
 huggingface_hub
 wandb
+mediapipe
+onnxruntime

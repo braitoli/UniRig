@@ -129,6 +129,8 @@ def run_job_background(job_id: str):
                 image_path=input_file,
                 output_dir=str(job_dir / gen_folder),
                 generator_type=generator_choice,
+                mesh_detail=metadata.get("mesh_detail"),
+                texture_detail=metadata.get("texture_detail"),
                 progress_callback=on_stage0_progress
             )
             current_3d_input = stage0_res["output_glb_path"]
@@ -136,7 +138,9 @@ def run_job_background(job_id: str):
                 "generated_glb": current_3d_input,
                 "generation_time_sec": stage0_res["generation_time_sec"],
                 "model_used": stage0_res["model_used"],
-                "generator_type": generator_choice
+                "generator_type": generator_choice,
+                "mesh_detail": stage0_res.get("mesh_detail"),
+                "texture_detail": stage0_res.get("texture_detail")
             }
             metadata["progress"] = {
                 "pct": 100,
@@ -265,6 +269,7 @@ def run_job_background(job_id: str):
             "glb_path": rigged_glb_path,
             "glb_size_bytes": rig_res["glb_size_bytes"],
             "animations": rig_res["animations"],
+            "blendshapes": rig_res.get("blendshapes", []),
             "export_time_sec": rig_res["export_time_sec"],
             "total_duration_sec": total_duration
         }
@@ -373,6 +378,8 @@ async def upload_custom_job(
     file: UploadFile = File(...),
     mode: str = Form("3d_only"),
     generator: str = Form("trellis"),
+    mesh_detail: str = Form("high"),
+    texture_detail: str = Form("high"),
     background_tasks: BackgroundTasks = None
 ):
     stem = Path(file.filename).stem
@@ -393,7 +400,9 @@ async def upload_custom_job(
         title=f"Custom: {file.filename}",
         input_filename=clean_filename,
         input_file_path=str(target_input),
-        metadata={"mode": mode, "generator": generator, "original_filename": file.filename}
+        metadata={"mode": mode, "generator": generator,
+                  "mesh_detail": mesh_detail, "texture_detail": texture_detail,
+                  "original_filename": file.filename}
     )
     
     background_tasks.add_task(run_job_background, job_id)
@@ -532,6 +541,7 @@ async def continue_rigging_endpoint(
                 "glb_path": rigged_glb_path,
                 "glb_size_bytes": rig_res["glb_size_bytes"],
                 "animations": rig_res["animations"],
+                "blendshapes": rig_res.get("blendshapes", []),
                 "export_time_sec": rig_res["export_time_sec"],
                 "total_duration_sec": total_duration
             }
@@ -566,12 +576,16 @@ async def get_job_details(job_id: str):
 @app.post("/api/jobs/{job_id}/reanimate")
 async def reanimate_job_endpoint(
     job_id: str,
-    use_neural_pan: bool = False,
+    use_neural_pan: bool = True,
     bvh_file_path: Optional[str] = None
 ):
     """
     Fast re-generation of Stage 4 animations (takes < 0.2s for kinematic, ~1-2s for Neural PAN)
     without re-running Neural mesh & skinning models.
+
+    Defaults to the mocap path, matching what the full pipeline runs. Defaulting to the
+    procedural one meant re-animating a job silently downgraded its motion -- and skipped the
+    Nod/HeadShake clips, which only the mocap path produces.
     """
     job = database.get_job(job_id)
     if not job:
@@ -618,8 +632,14 @@ async def reanimate_job_endpoint(
         if np.max(j_span) <= 2.5 and joints.min(axis=0)[1] < -0.2 and b_min[1] >= -0.1:
             joints = joints * scale + center
             
+        # Overwrite the GLB the pipeline actually produced, rather than deriving a name from
+        # the uploaded file. Those two disagree whenever stage 0 generated the mesh: the
+        # upload is "test15.png" but the pipeline works on "test15_generated_3d", so this
+        # endpoint used to write a second, differently-named GLB beside the original and the
+        # viewer went on serving the stale one.
         stem = Path(job["input_filename"]).stem
-        rigged_glb_path = str(job_dir / f"{stem}_rigged_animated.glb")
+        rigged_glb_path = (job.get("metadata", {}).get("rig", {}).get("glb_path")
+                           or str(job_dir / f"{stem}_rigged_animated.glb"))
 
         # raw_data.npz cannot hold images, so recover UV + PBR atlas from the cached stage1 GLB;
         # without this a re-animation would silently drop the texture.
@@ -667,6 +687,7 @@ async def reanimate_job_endpoint(
             "glb_path": rigged_glb_path,
             "glb_size_bytes": rig_res["glb_size_bytes"],
             "animations": rig_res["animations"],
+            "blendshapes": rig_res.get("blendshapes", []),
             "export_time_sec": round(t1 - t0, 3)
         }
         database.update_job(job_id, status="completed", metadata=metadata)
@@ -778,10 +799,18 @@ async def get_rigged_glb(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job_dir = STORAGE_DIR / job_id
-    matches = list(job_dir.glob("*_rigged_animated.glb"))
-    if matches and matches[0].exists():
+    # Serve the GLB this job recorded; fall back to the most recently written one. Taking
+    # whatever the glob happened to yield first served a stale file on any job that had ever
+    # been re-animated under the old naming.
+    recorded = job.get("metadata", {}).get("rig", {}).get("glb_path")
+    chosen = Path(recorded) if recorded and Path(recorded).exists() else None
+    if chosen is None:
+        matches = sorted(job_dir.glob("*_rigged_animated.glb"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        chosen = matches[0] if matches else None
+    if chosen is not None and chosen.exists():
         return FileResponse(
-            str(matches[0]),
+            str(chosen),
             media_type="model/gltf-binary",
             filename=f"{job['input_filename'].split('.')[0]}_rigged.glb"
         )
@@ -810,6 +839,15 @@ async def get_bone_weights(job_id: str, bone_index: int):
         "min_weight": float(col.min()),
         "max_weight": float(col.max()),
         "weights": col.tolist()
+    }
+
+@app.get("/api/facial_blendshapes/presets")
+async def get_facial_blendshapes_presets():
+    """Returns ARKit blendshapes list and facial expression presets."""
+    from pipeline.facial_blendshapes import ARKIT_BLENDSHAPES, EXPRESSION_PRESETS
+    return {
+        "blendshapes": ARKIT_BLENDSHAPES,
+        "presets": EXPRESSION_PRESETS
     }
 
 if __name__ == "__main__":

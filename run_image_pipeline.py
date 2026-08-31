@@ -43,6 +43,22 @@ def main():
         help="Random seed for generation"
     )
     parser.add_argument(
+        "--mesh-detail",
+        type=str,
+        default="high",
+        choices=["preview", "standard", "high"],
+        help="Detail of the generated geometry: diffusion grid and face count. "
+             "'preview' trades shape detail for speed (default: high)"
+    )
+    parser.add_argument(
+        "--texture-detail",
+        type=str,
+        default="high",
+        choices=["preview", "standard", "high"],
+        help="Detail of the baked texture. The bake dominates generation time, so "
+             "'preview' is the bigger speed-up of the two (default: high)"
+    )
+    parser.add_argument(
         "--3d_only",
         action="store_true",
         help="Only generate 3D GLB model from 2D image (Stage 0) without running Rig & Animation"
@@ -61,6 +77,7 @@ def main():
     print(f"Output dir:  {args.output_dir}")
     print(f"Generator:   {args.generator} ({gen_name})")
     print(f"Mode:        {'3D Generation Only' if getattr(args, '3d_only', False) else 'Full Pipeline (3D -> Rig -> Motion)'}")
+    print(f"Detail:      mesh={args.mesh_detail}, texture={args.texture_detail}")
     print("=" * 70)
 
     t0 = time.time()
@@ -74,7 +91,9 @@ def main():
             image_path=str(input_path),
             output_dir=str(out_stage0),
             seed=args.seed,
-            generator_type=args.generator
+            generator_type=args.generator,
+            mesh_detail=args.mesh_detail,
+            texture_detail=args.texture_detail
         )
         t1 = time.time()
         print("\n" + "=" * 70)
@@ -91,7 +110,9 @@ def main():
         job_id=job_id,
         work_dir=args.output_dir,
         generator_type=args.generator,
-        seed=args.seed
+        seed=args.seed,
+        mesh_detail=args.mesh_detail,
+        texture_detail=args.texture_detail
     )
     t1 = time.time()
 

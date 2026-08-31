@@ -66,6 +66,10 @@ def main():
     parser.add_argument('--resolution', type=str, default="1024", choices=["512", "1024", "1536"])
     parser.add_argument('--decimation_target', type=int, default=300000)
     parser.add_argument('--texture_size', type=int, default=4096)
+    parser.add_argument('--tex_slat_steps', type=int, default=30,
+                        help="texture SLAT sampler steps; the worker's own default is 30")
+    parser.add_argument('--sparse_structure_steps', type=int, default=12)
+    parser.add_argument('--shape_slat_steps', type=int, default=12)
     args = parser.parse_args()
 
     print(f"[TRELLIS.2] Loading Trellis2ImageTo3DPipeline (microsoft/TRELLIS.2-4B)...")
@@ -103,19 +107,19 @@ def main():
             preprocess_image=False,
             pipeline_type=pipeline_type,
             sparse_structure_sampler_params={
-                "steps": 12,
+                "steps": args.sparse_structure_steps,
                 "guidance_strength": 7.5,
                 "guidance_rescale": 0.7,
                 "rescale_t": 5.0,
             },
             shape_slat_sampler_params={
-                "steps": 12,
+                "steps": args.shape_slat_steps,
                 "guidance_strength": 7.5,
                 "guidance_rescale": 0.5,
                 "rescale_t": 3.0,
             },
             tex_slat_sampler_params={
-                "steps": 12,
+                "steps": args.tex_slat_steps,
                 "guidance_strength": 1.0,
                 "guidance_rescale": 0.0,
                 "rescale_t": 3.0,

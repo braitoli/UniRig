@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>UniRig — 3D Skeleton, Skinning & Animation Playground</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>👁️</text></svg>">
   <link rel="stylesheet" href="/static/styles.css?v=2.0">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- Three.js & Loaders -->
@@ -76,6 +77,30 @@
             <button type="button" class="generator-btn" data-generator="trellis" id="btn-gen-trellis" title="Microsoft TRELLIS.2-4B Unified 3D Model">
               <i class="fa-solid fa-bolt"></i> TRELLIS.2-4B
             </button>
+          </div>
+        </div>
+
+        <!-- Generation detail: geometry and texture chosen separately, because the
+             texture bake costs far more time than the diffusion grid does. -->
+        <div class="detail-select-container" style="margin-bottom: 10px;">
+          <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px;">
+            <i class="fa-solid fa-sliders"></i> Độ chi tiết
+          </div>
+          <div style="font-size: 10px; color: var(--text-muted); margin-bottom: 4px;">Lưới hình học</div>
+          <div class="detail-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+            <button type="button" class="generator-btn detail-btn" data-detail-kind="mesh" data-detail="preview" title="Lưới 512, 20k mặt, 6 bước sampler — đủ xem dáng, model nhẹ">Nháp</button>
+            <button type="button" class="generator-btn detail-btn" data-detail-kind="mesh" data-detail="standard" title="Lưới 1024, 150k mặt, 12 bước sampler">Vừa</button>
+            <button type="button" class="generator-btn detail-btn active" data-detail-kind="mesh" data-detail="high" title="Lưới 1024, 300k mặt, 12 bước sampler — mặc định">Cao</button>
+          </div>
+          <div style="font-size: 10px; color: var(--text-muted); margin-bottom: 4px;">Texture</div>
+          <div class="detail-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;">
+            <button type="button" class="generator-btn detail-btn" data-detail-kind="texture" data-detail="preview" title="Texture 512, 6 bước sampler — bề mặt mờ, file nhẹ">Nháp</button>
+            <button type="button" class="generator-btn detail-btn" data-detail-kind="texture" data-detail="standard" title="Texture 2048, 15 bước sampler">Vừa</button>
+            <button type="button" class="generator-btn detail-btn active" data-detail-kind="texture" data-detail="high" title="Texture 4096, 30 bước sampler — mặc định">Cao</button>
+          </div>
+          <div style="font-size: 9px; color: var(--text-muted); margin-top: 6px; opacity: .75; line-height: 1.4;">
+            Thời gian nằm ở diffusion, không ở số mặt — khâu dựng lưới chỉ tốn ~2s. Hạ số mặt
+            làm model nhẹ và bớt sắc nét chứ gần như không nhanh hơn.
           </div>
         </div>
 
@@ -182,8 +207,8 @@
             <button id="btn-run-pipeline" class="btn-primary" style="flex: 1;">
               <i class="fa-solid fa-bolt"></i> Chạy Full Pipeline
             </button>
-            <button id="btn-reanimate-fast" class="btn-secondary" style="flex: 1; margin-top: 0; background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); font-size: 11px; padding: 8px 10px;" title="Chạy lại ngay lập tức phần tạo chuyển động (0.1s) không cần chạy lại AI model">
-              <i class="fa-solid fa-person-running"></i> Tạo Motion (0.1s)
+            <button id="btn-reanimate-fast" class="btn-secondary" style="flex: 1; margin-top: 0; background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); font-size: 11px; padding: 8px 10px;" title="Chạy lại stage 4: chuyển động thân + dò mắt, dựng mí/mống mắt và toàn bộ clip biểu cảm. Không cần chạy lại model tạo 3D hay skinning.">
+              <i class="fa-solid fa-person-running"></i> Tạo lại Motion + Biểu cảm
             </button>
           </div>
         </div>
@@ -222,6 +247,9 @@
 
         <!-- Viewport Helpers -->
         <div class="viewport-tools">
+          <button id="btn-toggle-eyemask" class="tool-btn" title="Bật/Tắt Highlight Mask Vùng Mắt (Màu Xanh)">
+            <i class="fa-solid fa-eye" style="color: #00f2fe;"></i>
+          </button>
           <button id="btn-toggle-wireframe" class="tool-btn" title="Toggle Wireframe">
             <i class="fa-solid fa-border-all"></i>
           </button>
@@ -332,6 +360,49 @@
         </div>
       </div>
 
+      <!-- Eye Expressions Panel (Focused purely on eyes & brows) -->
+      <div class="panel-section" id="facial-expressions-section">
+        <div class="section-title">
+          <span><i class="fa-solid fa-eye" style="color: var(--accent-cyan);"></i> Biểu Cảm Mắt (Eye Expressions)</span>
+          <span id="blendshape-count-badge" style="font-size: 10px; color: var(--accent-cyan); background: rgba(0,242,254,0.1); padding: 2px 6px; border-radius: 4px;">17 Eye Targets</span>
+        </div>
+
+        <!-- Expression Quick Presets -->
+        <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">Biểu cảm mắt mẫu:</div>
+        <div class="expression-presets-grid">
+          <button class="expr-btn" data-preset="wink_right" title="Nháy mắt phải">😉 Nháy mắt phải</button>
+          <button class="expr-btn" data-preset="wink_left" title="Nháy mắt trái">😜 Nháy mắt trái</button>
+          <button class="expr-btn" data-preset="blink" title="Nhắm cả 2 mắt">😌 Nhắm 2 mắt</button>
+          <button class="expr-btn" data-preset="squint" title="Nheo mắt / Híp mắt">🧐 Nheo mắt</button>
+          <button class="expr-btn" data-preset="wide" title="Mở to mắt ngạc nhiên">😳 Mở to mắt</button>
+          <button class="expr-btn" data-preset="frown" title="Nhíu mắt / Cau có">😠 Nhíu mắt</button>
+          <button class="expr-btn" data-preset="look_up" title="Đảo mắt lên">🙄 Đảo mắt lên</button>
+          <button class="expr-btn" data-preset="look_left" title="Liếc mắt trái">👈 Liếc trái</button>
+          <button class="expr-btn" data-preset="look_right" title="Liếc mắt phải">👉 Liếc phải</button>
+          <button class="expr-btn reset" data-preset="neutral" title="Mắt mở bình thường">😐 Reset Mắt</button>
+        </div>
+
+        <!-- ARKit Blendshape Categories & Sliders (collapsible) -->
+        <div class="blendshape-sliders-container" id="blendshapes-accordion" style="margin-top: 10px;">
+          <!-- Category: Eyes -->
+          <div class="bs-category">
+            <div class="bs-category-header" data-cat="eyes">
+              <span><i class="fa-solid fa-eye"></i> Mí Mắt (Nháy, Nheo, Mở to)</span>
+              <i class="fa-solid fa-chevron-down toggle-icon"></i>
+            </div>
+            <div class="bs-sliders-list" id="bs-list-eyes"></div>
+          </div>
+          <!-- Category: Eyebrows & Gaze -->
+          <div class="bs-category">
+            <div class="bs-category-header" data-cat="brows">
+              <span><i class="fa-solid fa-arrows-up-down-left-right"></i> Cung Mày & Hướng Nhìn</span>
+              <i class="fa-solid fa-chevron-down toggle-icon"></i>
+            </div>
+            <div class="bs-sliders-list" id="bs-list-brows"></div>
+          </div>
+        </div>
+      </div>
+
       <!-- History Section (Save state & Resume) -->
       <div class="panel-section" style="flex: 1; display: flex; flex-direction: column;">
         <div class="section-title">
@@ -349,7 +420,7 @@
 
   </div>
 
-  <script src="/static/app.js?v=2.0"></script>
+  <script src="/static/app.js?v=5.2"></script>
 </body>
 </html>
 

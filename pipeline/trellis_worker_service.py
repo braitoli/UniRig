@@ -88,6 +88,37 @@ def load_global_pipeline():
     t0 = time.time()
     pipe = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     pipe.cuda()
+
+    # trellis2 loads each model with load_state_dict(..., strict=False) and no assign=True
+    # (trellis2/models/__init__.py). When a module happens to be constructed on the meta
+    # device, that copy is silently a no-op, the weights never land, and the failure only
+    # surfaces much later as "Cannot copy out of meta tensor" the first time a request
+    # touches that model -- observed here on the 1024_cascade branch while the machine was
+    # under load, with the 512 branch still answering normally. Refusing to come online is
+    # far better than serving one branch and 500-ing on the other.
+    # Flattened, because a cascade stage holds a list of models rather than one module,
+    # and that list is exactly where the failure was seen.
+    def modules_of(name, value):
+        if hasattr(value, "named_parameters"):
+            yield name, value
+        elif isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                yield from modules_of(f"{name}[{i}]", item)
+
+    stranded = [
+        f"{label}.{pname}"
+        for name, value in getattr(pipe, "models", {}).items()
+        for label, model in modules_of(name, value)
+        for pname, param in model.named_parameters()
+        if param.device.type == "meta"
+    ]
+    if stranded:
+        is_pipeline_loading = False
+        raise RuntimeError(
+            f"{len(stranded)} parameter(s) stayed on the meta device after loading, e.g. "
+            f"{stranded[:3]}. The checkpoint did not actually land; restart the worker."
+        )
+
     global_pipeline = pipe
     is_pipeline_loading = False
     print(f"[TRELLIS-Worker] Model successfully resident in GPU VRAM ({time.time() - t0:.2f}s). Ready for fast instant inference!")
@@ -116,7 +147,12 @@ class GenerateRequest(BaseModel):
     resolution: str = "1024"
     decimation_target: int = 300000
     texture_size: int = 4096
-    tex_slat_steps: int = 12
+    tex_slat_steps: int = 30   # measured: +9% sharpness over 12; 50 adds only ~3% more for +12% time
+    # The geometry samplers. Diffusion is ~95% of a preview's wall time (the mesh and
+    # bake stage runs in ~2.6s of ~45s), so these are the only knobs left that move the
+    # clock. Defaults reproduce the values that were hard-coded here.
+    sparse_structure_steps: int = 12
+    shape_slat_steps: int = 12
 
 @app.post("/generate")
 async def generate_3d(req: GenerateRequest):
@@ -146,13 +182,13 @@ async def generate_3d(req: GenerateRequest):
             preprocess_image=False,
             pipeline_type=pipeline_type,
             sparse_structure_sampler_params={
-                "steps": 12,
+                "steps": req.sparse_structure_steps,
                 "guidance_strength": 7.5,
                 "guidance_rescale": 0.7,
                 "rescale_t": 5.0,
             },
             shape_slat_sampler_params={
-                "steps": 12,
+                "steps": req.shape_slat_steps,
                 "guidance_strength": 7.5,
                 "guidance_rescale": 0.5,
                 "rescale_t": 3.0,

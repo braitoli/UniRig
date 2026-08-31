@@ -653,3 +653,145 @@ header {
   background: rgba(255, 255, 255, 0.15);
   transform: translateY(-1px);
 }
+
+/* Facial Expressions & ARKit Blendshapes Panel */
+.expression-presets-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.expr-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 6px 4px;
+  border-radius: var(--radius-md);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  user-select: none;
+}
+
+.expr-btn:hover {
+  background: rgba(0, 242, 254, 0.12);
+  border-color: var(--accent-cyan);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.expr-btn.active {
+  background: linear-gradient(135deg, rgba(0, 242, 254, 0.25), rgba(59, 130, 246, 0.25));
+  border-color: var(--accent-cyan);
+  color: #fff;
+  box-shadow: 0 0 8px rgba(0, 242, 254, 0.3);
+}
+
+.expr-btn.reset {
+  border-color: rgba(244, 63, 94, 0.4);
+  color: #fda4af;
+}
+
+.expr-btn.reset:hover {
+  background: rgba(244, 63, 94, 0.2);
+  border-color: var(--accent-rose);
+  color: #fff;
+}
+
+.blendshape-sliders-container {
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.bs-category {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  margin-bottom: 6px;
+  overflow: hidden;
+}
+
+.bs-category-header {
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.03);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  transition: background 0.2s;
+  user-select: none;
+}
+
+.bs-category-header:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.bs-category-header .toggle-icon {
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: transform 0.25s ease;
+}
+
+.bs-category.collapsed .toggle-icon {
+  transform: rotate(-90deg);
+}
+
+.bs-category.collapsed .bs-sliders-list {
+  display: none;
+}
+
+.bs-sliders-list {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.bs-slider-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.bs-slider-label {
+  width: 90px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bs-slider-input {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  outline: none;
+  accent-color: var(--accent-cyan);
+  cursor: pointer;
+}
+
+.bs-slider-val {
+  width: 32px;
+  text-align: right;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent-cyan);
+  font-variant-numeric: tabular-nums;
+}

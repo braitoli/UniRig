@@ -61,7 +61,8 @@ def create_rigged_glb(
     output_path: Optional[str] = None,
     base_color_texture: Optional[Any] = None,
     metallic_roughness_texture: Optional[Any] = None,
-    texture_quality: int = 90
+    texture_quality: int = 90,
+    morph_targets: Optional[Dict[str, np.ndarray]] = None
 ) -> bytes:
     """
     Creates a standard, valid binary glTF 2.0 (.glb) file with skinned mesh, bone hierarchy,
@@ -357,6 +358,28 @@ def create_rigged_glb(
     if col_acc is not None:
         attributes["COLOR_0"] = col_acc
 
+    # 9. Morph Targets (ARKit 52 facial blendshapes)
+    targets = []
+    target_names = []
+    if morph_targets:
+        for tgt_name, delta_pos in morph_targets.items():
+            delta_arr = delta_pos.astype(np.float32)
+            if len(delta_arr) != N:
+                continue
+            delta_bv = add_buffer_data(delta_arr.tobytes(), 34962)
+            delta_acc = len(accessors)
+            accessors.append({
+                "bufferView": delta_bv,
+                "byteOffset": 0,
+                "componentType": 5126, # FLOAT
+                "count": N,
+                "type": "VEC3",
+                "min": delta_arr.min(axis=0).tolist(),
+                "max": delta_arr.max(axis=0).tolist()
+            })
+            targets.append({"POSITION": delta_acc})
+            target_names.append(tgt_name)
+
     primitive = {
         "attributes": attributes,
         "indices": face_acc,
@@ -364,11 +387,19 @@ def create_rigged_glb(
     }
     if materials:
         primitive["material"] = 0
+    if targets:
+        primitive["targets"] = targets
 
-    meshes = [{
+    mesh_dict = {
         "name": "SkinnedMesh",
         "primitives": [primitive]
-    }]
+    }
+    if targets:
+        mesh_dict["weights"] = [0.0] * len(targets)
+        mesh_dict["extras"] = {"targetNames": target_names}
+        mesh_dict["targetNames"] = target_names
+
+    meshes = [mesh_dict]
     
     skins = [{
         "name": "UniRigSkin",
@@ -385,12 +416,29 @@ def create_rigged_glb(
             samplers = []
             
             for track in anim_data["tracks"]:
-                j_idx = track["joint_idx"]
-                node_idx = 1 + j_idx
                 path = track["path"]
                 times = track["times"].astype(np.float32)
                 values = track["values"].astype(np.float32)
-                
+
+                if path == "weights":
+                    # Morph-target weights animate the mesh node itself rather than a
+                    # joint, and glTF stores them flat: one SCALAR per target per keyframe,
+                    # in the order the targets were declared. A track written against a
+                    # different target count than this mesh ended up with would silently
+                    # animate the wrong shapes, so it is dropped instead.
+                    if not targets or values.ndim != 2 or values.shape[1] != len(targets):
+                        print(f"[RigExport] Skipping '{anim_name}' weights track: expected "
+                              f"(frames, {len(targets)}) values, got {values.shape}.")
+                        continue
+                    node_idx = 0
+                    value_type = "SCALAR"
+                    value_count = int(values.size)
+                    values = np.ascontiguousarray(values.reshape(-1))
+                else:
+                    node_idx = 1 + track["joint_idx"]
+                    value_type = "VEC4" if path == "rotation" else "VEC3"
+                    value_count = len(values)
+
                 time_bv = add_buffer_data(times)
                 time_acc = len(accessors)
                 accessors.append({
@@ -409,8 +457,8 @@ def create_rigged_glb(
                     "bufferView": val_bv,
                     "byteOffset": 0,
                     "componentType": 5126,
-                    "count": len(values),
-                    "type": "VEC4" if path == "rotation" else "VEC3"
+                    "count": value_count,
+                    "type": value_type
                 })
                 
                 sampler_idx = len(samplers)
