@@ -49,12 +49,28 @@ def evaluate_mesh_integrity(mesh: trimesh.Trimesh) -> Dict[str, Any]:
     shortest_alt = twice_area / np.maximum(edge_lengths.reshape(-1, 3).max(axis=1), 1e-12)
     sliver_count = int((shortest_alt < 0.05 * median_edge).sum())
 
+    # Edge stretch & collapse metrics (from FaceParsing integrity evaluation)
+    relative_edge = valid_edges / median_edge
+    torn_edges = int((relative_edge > 1.6).sum())
+    folded_edges = int((relative_edge < 0.45).sum())
+
     # 3. Watertight & Boundary analysis
     is_watertight = bool(mesh.is_watertight)
     euler_number = int(mesh.euler_number) if hasattr(mesh, "euler_number") else 2
 
     # 4. Flipped normals / normal consistency
     has_consistent_winding = bool(getattr(mesh, "is_winding_consistent", True))
+    
+    # Inverted normals check: dot product with vertex normals
+    face_normals = getattr(mesh, "face_normals", None)
+    flipped_count = 0
+    if face_normals is not None and len(face_normals) == n_faces:
+        vert_normals = mesh.vertex_normals
+        avg_vert_normals = vert_normals[faces].mean(axis=1)
+        norm_avg = np.linalg.norm(avg_vert_normals, axis=1)
+        valid_norm = (norm_avg > 1e-6) & (twice_area > 1e-12)
+        dot_product = (face_normals[valid_norm] * avg_vert_normals[valid_norm]).sum(axis=1)
+        flipped_count = int((dot_product < 0).sum())
 
     # 5. Composite Quality Score calculation (0 - 100)
     deductions = 0
@@ -64,8 +80,10 @@ def evaluate_mesh_integrity(mesh: trimesh.Trimesh) -> Dict[str, Any]:
         deductions += min(25, int(degenerate_count / max(1, n_faces) * 500))
     if sliver_count > 0:
         deductions += min(15, int(sliver_count / max(1, n_faces) * 200))
-    if not has_consistent_winding:
+    if not has_consistent_winding or flipped_count > 0:
         deductions += 20
+    if torn_edges > 0:
+        deductions += min(10, int(torn_edges / max(1, len(valid_edges)) * 100))
 
     score = max(50, 100 - deductions)
 
@@ -74,11 +92,14 @@ def evaluate_mesh_integrity(mesh: trimesh.Trimesh) -> Dict[str, Any]:
         "quality_score": score,
         "is_watertight": is_watertight,
         "has_consistent_winding": has_consistent_winding,
+        "flipped_faces": flipped_count,
         "euler_number": euler_number,
         "num_vertices": n_verts,
         "num_faces": n_faces,
         "degenerate_faces": degenerate_count,
         "sliver_faces": sliver_count,
+        "torn_edges": torn_edges,
+        "folded_edges": folded_edges,
         "median_edge_length": round(median_edge, 6),
         "bounding_box_span": round(span, 4),
     }

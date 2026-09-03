@@ -876,6 +876,50 @@ class FacialBlendshapesTransfer:
         # is not part of the eye at all (the lids, the surrounding skin). The caller masks
         # this function's output over that geometry before merging the two.
 
+        # Guarantee geometric soundness (FaceParsing port): eliminate inverted faces & black shards
+        morph_targets = constrain_blendshape_soundness(vertices, faces, morph_targets)
+
         elapsed = time.time() - t0
         print(f"[FacialBlendshapes] Successfully transferred {len(morph_targets)} ARKit blendshapes in {elapsed:.2f}s (head vertices: {len(head_indices)}/{N})")
         return morph_targets
+
+
+def constrain_blendshape_soundness(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    morph_targets: Dict[str, np.ndarray],
+    area_floor: float = 0.25,
+    backoff: float = 0.85
+) -> Dict[str, np.ndarray]:
+    """
+    Guarantees facial expression morph target geometric soundness (ported from FaceParsing):
+    1. Prevents inverted/reversed triangles (black shards) on thin facial features (eyebrows, eyelids, mustache).
+    2. Bounds deformation so skin and fine feature boundaries do not fold inside-out.
+    3. Smoothly scales back delta on problematic vertices until triangles stay healthy.
+    """
+    if not morph_targets or len(vertices) == 0 or len(faces) == 0:
+        return morph_targets
+
+    tri = vertices[faces]
+    rest_normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    rest_area = np.linalg.norm(rest_normal, axis=1)
+    solid = rest_area > 1e-12
+    unit_normal = np.zeros_like(rest_normal)
+    unit_normal[solid] = rest_normal[solid] / rest_area[solid][:, None]
+
+    constrained = {}
+    for name, delta in morph_targets.items():
+        cur_delta = delta.copy()
+        for _ in range(10):
+            moved = vertices + cur_delta
+            moved_tri = moved[faces]
+            after_normal = np.cross(moved_tri[:, 1] - moved_tri[:, 0], moved_tri[:, 2] - moved_tri[:, 0])
+            dot = (after_normal * unit_normal).sum(axis=1)
+            bad_faces = solid & (dot < area_floor * rest_area)
+            if not bad_faces.any():
+                break
+            bad_verts = np.unique(faces[bad_faces])
+            cur_delta[bad_verts] *= backoff
+        constrained[name] = cur_delta
+
+    return constrained

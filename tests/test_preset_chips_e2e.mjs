@@ -51,9 +51,10 @@ try {
     await send('Page.enable');
     await send('Runtime.enable');
     await send('DOM.enable');
+    await send('Page.navigate', { url: 'http://localhost:7860/statue' });
 
     // Wait until document.title is loaded
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 40; i++) {
         const titleRes = await send('Runtime.evaluate', { expression: 'document.title' });
         if (titleRes?.result?.value?.includes('Statue')) break;
         await new Promise(r => setTimeout(r, 250));
