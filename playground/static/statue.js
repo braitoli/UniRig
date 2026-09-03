@@ -27,7 +27,8 @@ const state = {
     animClips: [],
     activeAction: null,
     isAnimPlaying: false,
-    automationConfig: null
+    automationConfig: null,
+    modelRotation: { rx: 0, ry: 0, rz: 0 }
 };
 
 // 24 Standard Vibrant Statue Painting Colors
@@ -882,7 +883,43 @@ function initUIEvents() {
     document.getElementById('btn-save-auto-config').addEventListener('click', saveAutomationConfig);
     document.getElementById('btn-scan-now').addEventListener('click', triggerManualScan);
     document.getElementById('btn-test-webhook').addEventListener('click', testWebhookPing);
-    document.getElementById('btn-refresh-history').addEventListener('click', loadStatueHistory);
+    // Axis Orientation Popover & Rotation Controls
+    const btnToggleOrientation = document.getElementById('btn-toggle-orientation-menu');
+    const orientationPopover = document.getElementById('orientation-menu-popover');
+    if (btnToggleOrientation && orientationPopover) {
+        btnToggleOrientation.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isShown = orientationPopover.style.display === 'block';
+            orientationPopover.style.display = isShown ? 'none' : 'block';
+        });
+        document.addEventListener('click', (e) => {
+            if (!orientationPopover.contains(e.target) && e.target !== btnToggleOrientation) {
+                orientationPopover.style.display = 'none';
+            }
+        });
+    }
+
+    document.getElementById('btn-rotate-car-horizontal')?.addEventListener('click', () => {
+        rotateCurrentModel(-90, 0, 0);
+    });
+    document.getElementById('btn-rotate-upright')?.addEventListener('click', () => {
+        rotateCurrentModel(90, 0, 0);
+    });
+    document.getElementById('btn-rotate-x-90')?.addEventListener('click', () => {
+        rotateCurrentModel(90, 0, 0);
+    });
+    document.getElementById('btn-rotate-y-90')?.addEventListener('click', () => {
+        rotateCurrentModel(0, 90, 0);
+    });
+    document.getElementById('btn-rotate-z-90')?.addEventListener('click', () => {
+        rotateCurrentModel(0, 0, 90);
+    });
+    document.getElementById('btn-reset-rotation')?.addEventListener('click', () => {
+        resetModelRotation();
+    });
+    document.getElementById('btn-save-model-rotation')?.addEventListener('click', () => {
+        saveModelRotationToBackend();
+    });
 }
 
 function setStudioEngine(engine) {
@@ -919,15 +956,106 @@ function setStudioEngine(engine) {
     }
 }
 
-function syncModelTo3DPaintingIframe() {
+function rotateCurrentModel(rxDeg, ryDeg, rzDeg) {
+    if (!currentModel) return;
+    state.modelRotation.rx = (state.modelRotation.rx + rxDeg) % 360;
+    state.modelRotation.ry = (state.modelRotation.ry + ryDeg) % 360;
+    state.modelRotation.rz = (state.modelRotation.rz + rzDeg) % 360;
+
+    // Apply rotation around world axes so rotation is intuitive
+    if (rxDeg) currentModel.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), THREE.MathUtils.degToRad(rxDeg));
+    if (ryDeg) currentModel.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(ryDeg));
+    if (rzDeg) currentModel.rotateOnWorldAxis(new THREE.Vector3(0, 0, 1), THREE.MathUtils.degToRad(rzDeg));
+
+    // Re-center horizontally and place base flat at ground Y = 0
+    const bbox = new THREE.Box3().setFromObject(currentModel);
+    const center = bbox.getCenter(new THREE.Vector3());
+    currentModel.position.x -= center.x;
+    currentModel.position.z -= center.z;
+    currentModel.position.y -= bbox.min.y;
+
+    const size = bbox.getSize(new THREE.Vector3());
+    controls.target.set(0, size.y * 0.5, 0);
+    controls.update();
+
+    // Send rotation notification to 3DPainting iframe
+    try {
+        const iframe = document.getElementById('iframe-3dpainting');
+        iframe?.contentWindow?.postMessage({
+            type: 'ROTATE_MODEL',
+            rx: rxDeg,
+            ry: ryDeg,
+            rz: rzDeg
+        }, '*');
+    } catch (e) {}
+}
+
+function resetModelRotation() {
+    state.modelRotation = { rx: 0, ry: 0, rz: 0 };
+    if (state.currentGlbUrl) {
+        load3DStatueModel(state.currentGlbUrl, state.activeMode, state.currentStatueName);
+    }
+}
+
+async function saveModelRotationToBackend() {
+    if (!state.activeJobId && !state.currentPresetKey) {
+        alert("Vui lòng chọn một tác phẩm hoặc preset để lưu hướng trục!");
+        return;
+    }
+    const btnSave = document.getElementById('btn-save-model-rotation');
+    const origText = btnSave.innerHTML;
+    btnSave.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang lưu...';
+    btnSave.disabled = true;
+
+    try {
+        const payload = {
+            job_id: state.activeJobId || null,
+            preset_key: state.activeJobId ? null : state.currentPresetKey,
+            rx: state.modelRotation.rx,
+            ry: state.modelRotation.ry,
+            rz: state.modelRotation.rz,
+            re_ground: true
+        };
+        const res = await fetch('/api/statue/rotate_model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.success) {
+            btnSave.innerHTML = '<i class="fa-solid fa-check"></i> Đã lưu thành công!';
+            state.modelRotation = { rx: 0, ry: 0, rz: 0 };
+            // Sync updated model to 3DPainting iframe
+            syncModelTo3DPaintingIframe(true);
+            setTimeout(() => {
+                btnSave.innerHTML = origText;
+                btnSave.disabled = false;
+                const pop = document.getElementById('orientation-menu-popover');
+                if (pop) pop.style.display = 'none';
+            }, 1200);
+        } else {
+            alert("Lỗi khi lưu: " + (data.detail || data.message));
+            btnSave.innerHTML = origText;
+            btnSave.disabled = false;
+        }
+    } catch (err) {
+        console.error('Save rotation error:', err);
+        alert("Không thể kết nối đến máy chủ để lưu trục!");
+        btnSave.innerHTML = origText;
+        btnSave.disabled = false;
+    }
+}
+
+function syncModelTo3DPaintingIframe(forceReload = false) {
     const iframe = document.getElementById('iframe-3dpainting');
     if (!iframe) return;
     const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
     const name = state.currentStatueName || 'Tượng 3D UniRig';
 
-    const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}&embedded=1`;
+    const cacheParam = forceReload ? `&_t=${Date.now()}` : '';
+    const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}&embedded=1${cacheParam}`;
     const currentSrc = iframe.getAttribute('src') || '';
-    if (!currentSrc || !currentSrc.includes(encodeURIComponent(url))) {
+    if (forceReload || !currentSrc || !currentSrc.includes(encodeURIComponent(url))) {
         iframe.src = targetSrc;
     }
     try {
@@ -990,6 +1118,7 @@ async function startStatueGeneration() {
     formData.append('texture_detail', 'high');
     formData.append('target_faces', targetFaces);
     formData.append('pedestal_shape', pedestalShape);
+    formData.append('orientation', document.getElementById('statue-orientation-select')?.value || 'auto');
     formData.append('enable_rigging', enableRigging);
 
     const btn = document.getElementById('btn-generate-statue');

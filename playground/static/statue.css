@@ -1108,3 +1108,70 @@ body {
     font-weight: 600;
     color: var(--text-secondary);
 }
+
+/* Axis Orientation Popover Menu */
+.dropdown-wrap {
+    position: relative;
+    display: inline-flex;
+}
+
+.dropdown-menu-popover {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 250px;
+    background: rgba(18, 22, 33, 0.98);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 12px;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.7);
+    padding: 12px;
+    z-index: 1000;
+}
+
+.popover-header {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.popover-btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.popover-action-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    color: #f1f5f9;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.popover-action-btn:hover {
+    background: rgba(99, 102, 241, 0.25);
+    border-color: #6366f1;
+    color: #fff;
+    transform: translateY(-1px);
+}
+
+.popover-action-btn:active {
+    transform: scale(0.97);
+}

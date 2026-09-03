@@ -49,24 +49,36 @@ def clean_and_repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 def auto_ground_and_orient(
     mesh: trimesh.Trimesh,
     target_height: float = 1.6,
-    flatten_bottom: bool = True
+    flatten_bottom: bool = True,
+    orientation: str = "auto"
 ) -> trimesh.Trimesh:
     """
-    Ensures model is Y-up, centered at (0, 0) in X/Z, scaled to standard height,
-    and resting flat on the ground plane Y = 0.
+    Ensures model is properly oriented (supporting horizontal mode for vehicles/quadrupeds),
+    centered at (0, 0) in X/Z, scaled to standard height, and resting flat on Y = 0.
     """
     m = mesh.copy()
     v = m.vertices.copy().astype(np.float32)
     extents = v.max(axis=0) - v.min(axis=0)
 
-    # If Z-extent is larger than Y-extent, model is Z-up (typical from TRELLIS diffusion)
-    if extents[2] > extents[1] * 1.15:
-        x = v[:, 0].copy()
-        y = v[:, 1].copy()
-        z = v[:, 2].copy()
-        v[:, 0] = x
-        v[:, 1] = z
-        v[:, 2] = -y
+    if orientation == "horizontal":
+        # Force model to lie horizontally flat:
+        # If height (Y) is greater than length (Z), rotate -90 deg on X so it lies flat
+        if extents[1] > extents[2]:
+            x = v[:, 0].copy()
+            y = v[:, 1].copy()
+            z = v[:, 2].copy()
+            v[:, 0] = x
+            v[:, 1] = -z
+            v[:, 2] = y
+    elif orientation == "upright":
+        # Force model to stand upright
+        if extents[2] > extents[1] * 1.5:
+            x = v[:, 0].copy()
+            y = v[:, 1].copy()
+            z = v[:, 2].copy()
+            v[:, 0] = x
+            v[:, 1] = z
+            v[:, 2] = -y
 
     # Center in X and Z
     b_min = v.min(axis=0)

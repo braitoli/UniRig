@@ -148,6 +148,15 @@
                             </select>
                         </div>
 
+                        <div class="form-row">
+                            <label class="form-label">Hướng Đặt Tượng:</label>
+                            <select class="form-select" id="statue-orientation-select">
+                                <option value="auto" selected>🤖 Tự Động Nhận Diện</option>
+                                <option value="horizontal">🚗 Nằm Ngang (Xe cộ / Thú 4 chân)</option>
+                                <option value="upright">🧍 Đứng Thẳng (Nhân vật / Người)</option>
+                            </select>
+                        </div>
+
                         <div class="form-row checkbox-row">
                             <label class="checkbox-container">
                                 <input type="checkbox" id="enable-rigging-checkbox">
@@ -209,6 +218,41 @@
                     </div>
 
                     <div class="toolbar-group">
+                        <!-- Model Axis & Orientation Controls -->
+                        <div class="dropdown-wrap" id="orientation-dropdown-wrap" style="margin-right: 6px;">
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-toggle-orientation-menu" title="Xoay hướng trục mô hình (Nằm ngang / Đứng thẳng / Xoay 90°)" style="font-size:12px; padding: 5px 10px; gap: 6px;">
+                                <i class="fa-solid fa-compass-drafting"></i> <span>Xoay Trục</span>
+                            </button>
+                            <div class="dropdown-menu-popover" id="orientation-menu-popover" style="display:none;">
+                                <div class="popover-header"><i class="fa-solid fa-compass-drafting"></i> Hướng Trục Mô Hình 3D</div>
+                                <div class="popover-btn-grid">
+                                    <button type="button" class="popover-action-btn" id="btn-rotate-car-horizontal" title="Lật nằm ngang ngay lập tức (Xe cộ / Thú 4 chân)">
+                                        <i class="fa-solid fa-car-side"></i> <span>Nằm Ngang (Xe)</span>
+                                    </button>
+                                    <button type="button" class="popover-action-btn" id="btn-rotate-upright" title="Đặt đứng thẳng (Nhân vật / Người)">
+                                        <i class="fa-solid fa-person"></i> <span>Đứng Thẳng</span>
+                                    </button>
+                                    <button type="button" class="popover-action-btn" id="btn-rotate-x-90" title="Lật trước/sau 90°">
+                                        <i class="fa-solid fa-arrows-rotate"></i> <span>Xoay X +90°</span>
+                                    </button>
+                                    <button type="button" class="popover-action-btn" id="btn-rotate-y-90" title="Xoay trái/phải 90°">
+                                        <i class="fa-solid fa-rotate-right"></i> <span>Xoay Y +90°</span>
+                                    </button>
+                                    <button type="button" class="popover-action-btn" id="btn-rotate-z-90" title="Lật nghiêng 90°">
+                                        <i class="fa-solid fa-arrow-rotate-left"></i> <span>Xoay Z +90°</span>
+                                    </button>
+                                    <button type="button" class="popover-action-btn" id="btn-reset-rotation" title="Trả về góc ban đầu">
+                                        <i class="fa-solid fa-rotate-left"></i> <span>Đặt Lại</span>
+                                    </button>
+                                </div>
+                                <div class="popover-footer" style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px;">
+                                    <button type="button" class="btn btn-primary btn-sm btn-block" id="btn-save-model-rotation" title="Lưu vĩnh viễn hướng trục này vào các file GLB trên máy chủ">
+                                        <i class="fa-solid fa-floppy-disk"></i> Lưu Trục Vào File GLB
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
                         <div class="preview-controls-group" id="preview-controls-group" style="display:flex; gap:6px;">
                             <button class="btn-icon" id="btn-reset-camera" title="Căn giữa góc nhìn"><i class="fa-solid fa-compress"></i></button>
                             <button class="btn-icon" id="btn-toggle-grid" title="Bật/tắt mặt sàn"><i class="fa-solid fa-table-cells"></i></button>

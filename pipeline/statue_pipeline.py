@@ -53,6 +53,7 @@ class Statue3DPipeline:
         pedestal_height: float = 0.05,
         target_height: float = 1.6,
         flatten_bottom: bool = True,
+        orientation: str = "auto",
         enable_rigging: bool = False,
         seed: int = 42,
         progress_callback: Optional[Callable[[int, str, int, int], None]] = None
@@ -106,7 +107,8 @@ class Statue3DPipeline:
         mesh = auto_ground_and_orient(
             mesh,
             target_height=target_height,
-            flatten_bottom=flatten_bottom
+            flatten_bottom=flatten_bottom,
+            orientation=orientation
         )
 
         # Step 3: Pedestal Base

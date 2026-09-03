@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 import uvicorn
+import trimesh
+import zipfile
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -900,6 +903,7 @@ def run_statue_job_background(job_id: str):
             texture_detail=job.get("texture_detail", "high"),
             target_faces=int(job.get("target_faces", 50000)),
             pedestal_shape=job.get("pedestal_shape", "round"),
+            orientation=metadata.get("orientation", "auto"),
             enable_rigging=bool(job.get("enable_rigging", 0)),
             progress_callback=on_progress
         )
@@ -963,6 +967,7 @@ async def create_statue_generation_job(
     texture_detail: str = Form("high"),
     target_faces: int = Form(50000),
     pedestal_shape: str = Form("round"),
+    orientation: str = Form("auto"),
     enable_rigging: bool = Form(False),
     seed: int = Form(42),
     background_tasks: BackgroundTasks = None
@@ -983,6 +988,7 @@ async def create_statue_generation_job(
     metadata = {
         "original_filename": file.filename,
         "seed": seed,
+        "orientation": orientation,
         "progress": {"pct": 5, "step_name": "Đã đưa vào hàng đợi xử lý...", "step_idx": 1, "total_steps": 5}
     }
     job = database.create_statue_job(
@@ -1031,6 +1037,74 @@ async def delete_statue_job_endpoint(job_id: str):
     if job_dir.exists():
         shutil.rmtree(str(job_dir), ignore_errors=True)
     return {"status": "deleted", "job_id": job_id}
+
+class StatueRotateRequest(BaseModel):
+    job_id: Optional[str] = None
+    preset_key: Optional[str] = None
+    rx: float = 0.0
+    ry: float = 0.0
+    rz: float = 0.0
+    re_ground: bool = True
+
+@app.post("/api/statue/rotate_model")
+async def rotate_statue_model_endpoint(req: StatueRotateRequest):
+    job_dir = None
+    if req.job_id:
+        job = database.get_statue_job(req.job_id)
+        job_dir = STORAGE_DIR / f"statue_jobs/{req.job_id}"
+    elif req.preset_key:
+        job_dir = ROOT_DIR / f"playground/static/sample_presets/models/{req.preset_key}"
+
+    if not job_dir or not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Mô hình hoặc Job tượng không tìm thấy")
+
+    rad_x = np.radians(req.rx)
+    rad_y = np.radians(req.ry)
+    rad_z = np.radians(req.rz)
+    Rx = trimesh.transformations.rotation_matrix(rad_x, [1, 0, 0])
+    Ry = trimesh.transformations.rotation_matrix(rad_y, [0, 1, 0])
+    Rz = trimesh.transformations.rotation_matrix(rad_z, [0, 0, 1])
+    T_rot = trimesh.transformations.concatenate_matrices(Rz, Ry, Rx)
+
+    glb_files = list(job_dir.glob("*.glb"))
+    if not glb_files:
+        raise HTTPException(status_code=404, detail="Không tìm thấy file GLB nào để xoay")
+
+    modified_files = []
+    for glb_path in glb_files:
+        try:
+            m = trimesh.load(str(glb_path), process=False)
+            m.apply_transform(T_rot)
+            if req.re_ground:
+                bounds = m.bounds
+                center_x = (bounds[0][0] + bounds[1][0]) / 2.0
+                center_z = (bounds[0][2] + bounds[1][2]) / 2.0
+                min_y = bounds[0][1]
+                m.apply_translation([-center_x, -min_y, -center_z])
+            m.export(str(glb_path))
+            modified_files.append(glb_path.name)
+        except Exception as e:
+            print(f"Lỗi khi xoay {glb_path.name}: {e}")
+
+    # Cập nhật lại file zip nếu có
+    zip_matches = list(job_dir.glob("*_statue_package.zip"))
+    if zip_matches:
+        pkg_zip = zip_matches[0]
+        try:
+            with zipfile.ZipFile(str(pkg_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in job_dir.iterdir():
+                    if f != pkg_zip and not f.is_dir():
+                        zf.write(str(f), arcname=f.name)
+        except Exception as ze:
+            print(f"Lỗi khi cập nhật zip: {ze}")
+
+    return {
+        "success": True,
+        "message": f"Đã xoay trục thành công (X: {req.rx}°, Y: {req.ry}°, Z: {req.rz}°)",
+        "job_id": req.job_id,
+        "preset_key": req.preset_key,
+        "modified_files": modified_files
+    }
 
 @app.api_route("/api/statue/jobs/{job_id}/files/{file_type}", methods=["GET", "HEAD"])
 async def get_statue_file_endpoint(job_id: str, file_type: str):
