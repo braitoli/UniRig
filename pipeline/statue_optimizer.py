@@ -35,8 +35,8 @@ STATUE_PALETTE = [
     {"name": "Màu xanh ngọc (Cyan Pearl)", "hex": "#4DD0E1", "rgb": [77, 208, 225]},
 ]
 
-def clean_and_repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Removes duplicate vertices, unreferenced vertices, and repairs normals."""
+def clean_and_repair_mesh(mesh: trimesh.Trimesh, cull_hidden: bool = True) -> trimesh.Trimesh:
+    """Removes duplicate vertices, unreferenced vertices, repairs normals, and culls interior buried geometry."""
     m = mesh.copy()
     if isinstance(m, trimesh.Scene):
         m = m.dump(concatenate=True)
@@ -44,6 +44,20 @@ def clean_and_repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     m.remove_unreferenced_vertices()
     trimesh.repair.fix_normals(m)
     trimesh.repair.fix_winding(m)
+
+    if cull_hidden and len(m.faces) > 500:
+        try:
+            from pipeline.culling_engine import clean_and_cull_mesh
+            cleaned, report, _ = clean_and_cull_mesh(m, remove_hidden=True, views=16, resolution=256)
+            if report.get("applied", False):
+                m = cleaned
+                print(f"[StatueOptimizer] culling_engine: removed {report.get('removed_faces', 0)} faces "
+                      f"({report.get('hidden', 0)} hidden, {report.get('degenerate', 0)} degen, {report.get('duplicate', 0)} dup), "
+                      f"patched {report.get('patched', 0)} faces.")
+        except Exception as e:
+            print(f"[StatueOptimizer] culling_engine notice: {e}")
+
+    trimesh.repair.fix_normals(m)
     return m
 
 def auto_ground_and_orient(
@@ -308,25 +322,21 @@ def extract_and_optimize_outer_shell(
     """
     m = mesh.copy()
 
-    # 1. Advanced Hidden & Interior Geometry Removal (via FaceParsing mesh_cleanup)
-    cleaned_by_faceparsing = False
+    # 1. Advanced Hidden & Interior Geometry Removal (via pipeline.culling_engine)
+    cleaned_by_culling = False
     try:
-        import sys
-        faceparsing_dir = Path(__file__).resolve().parent.parent / "FaceParsing"
-        if faceparsing_dir.exists() and str(faceparsing_dir) not in sys.path:
-            sys.path.insert(0, str(faceparsing_dir))
-        from app.mesh_cleanup import clean_mesh as faceparsing_clean_mesh
-        cleaned_mesh, report, _ = faceparsing_clean_mesh(m, remove_hidden=True, views=16, resolution=256)
+        from pipeline.culling_engine import clean_and_cull_mesh
+        cleaned_mesh, report, _ = clean_and_cull_mesh(m, remove_hidden=True, views=16, resolution=256)
         if report.get("applied", False):
             m = cleaned_mesh
-            cleaned_by_faceparsing = True
-            print(f"[StatueOptimizer] FaceParsing clean_mesh applied: removed {report.get('removed_faces', 0)} faces "
+            cleaned_by_culling = True
+            print(f"[StatueOptimizer] culling_engine applied: removed {report.get('removed_faces', 0)} faces "
                   f"({report.get('hidden', 0)} hidden, {report.get('degenerate', 0)} degen, {report.get('duplicate', 0)} dup), "
                   f"patched {report.get('patched', 0)} faces.")
     except Exception as err:
-        print(f"[StatueOptimizer] FaceParsing clean_mesh fallback ({err})")
+        print(f"[StatueOptimizer] culling_engine fallback ({err})")
 
-    if not cleaned_by_faceparsing:
+    if not cleaned_by_culling:
         # Native fallback: Clean degenerate & duplicate triangles
         vertices = np.asarray(m.vertices, dtype=np.float64)
         faces = np.asarray(m.faces, dtype=np.int64)
@@ -360,7 +370,7 @@ def extract_and_optimize_outer_shell(
     trimesh.repair.fix_normals(m)
     _ = m.vertex_normals
 
-    # 3. Optimize texture map (downscale from 4K to 2K, compress)
+    # 2. Optimize texture map (downscale from 4K to 2K, compress)
     if hasattr(m, "visual") and hasattr(m.visual, "material") and m.visual.material:
         mat = m.visual.material
         img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
@@ -392,9 +402,9 @@ def export_all_statue_variants(
     - Pure plaster white GLB
     - Multi-part segmented GLB
     - ID-colored vertex GLB
-    - Original Textured GLB
+    - Original Textured GLB (with WebP compression)
     - Lightweight Outer Shell GLB (Chỉ lấy phần vỏ ngoài siêu nhẹ)
-    - Metadata manifest JSON
+    - Metadata manifest JSON with Mesh Integrity metrics
     - Complete ZIP package
     """
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -471,7 +481,7 @@ def export_all_statue_variants(
         _ = original_texture_mesh.vertex_normals
         textured_glb_path = output_dir / f"{stem}_textured.glb"
         tex_scene = trimesh.Scene({"Statue_Textured": original_texture_mesh})
-        tex_glb_bytes = trimesh.exchange.gltf.export_glb(tex_scene, include_normals=True)
+        tex_glb_bytes = trimesh.exchange.gltf.export_glb(tex_scene, include_normals=True, extension_webp=True)
         with open(textured_glb_path, "wb") as fp:
             fp.write(tex_glb_bytes)
         exported_files["textured_glb"] = str(textured_glb_path)
@@ -493,7 +503,10 @@ def export_all_statue_variants(
             fp.write(shell_glb_bytes)
         exported_files["shell_glb"] = str(shell_glb_path)
 
-    # 5. Metadata Manifest JSON
+    # 5. Metadata Manifest JSON with Mesh Integrity Metrics
+    from pipeline.mesh_integrity import evaluate_mesh_integrity
+    integrity_report = evaluate_mesh_integrity(base_mesh)
+
     manifest = {
         "statue_id": stem,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -506,6 +519,7 @@ def export_all_statue_variants(
                 "height": round(float(base_mesh.bounds[1][1] - base_mesh.bounds[0][1]), 4)
             }
         },
+        "mesh_integrity": integrity_report,
         "painting_parts": part_info,
         "files": {k: Path(v).name for k, v in exported_files.items()}
     }

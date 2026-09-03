@@ -111,6 +111,22 @@ class TestStatueOptimizer(unittest.TestCase):
                 self.assertTrue(p.exists(), f"File {key} does not exist at {p}")
                 self.assertGreater(p.stat().st_size, 0, f"File {key} is empty")
 
+    def test_culling_engine(self):
+        from pipeline.culling_engine import clean_and_cull_mesh
+        box = trimesh.creation.box()
+        cleaned, report, survived = clean_and_cull_mesh(box, remove_hidden=False)
+        self.assertIn("faces_before", report)
+        self.assertIn("faces_after", report)
+        self.assertGreater(len(cleaned.faces), 0)
+
+    def test_mesh_integrity(self):
+        from pipeline.mesh_integrity import evaluate_mesh_integrity
+        box = trimesh.creation.box()
+        report = evaluate_mesh_integrity(box)
+        self.assertTrue(report["is_valid"])
+        self.assertGreaterEqual(report["quality_score"], 90)
+        self.assertTrue(report["is_watertight"])
+
 
 class TestStatueDatabase(unittest.TestCase):
     def setUp(self):

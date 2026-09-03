@@ -103,13 +103,20 @@ class Statue3DPipeline:
             textured_mesh = raw_scene_or_mesh.copy()
 
         # Step 2: Clean, orient, and ground
-        mesh = clean_and_repair_mesh(raw_mesh)
+        mesh = clean_and_repair_mesh(raw_mesh, cull_hidden=True)
         mesh = auto_ground_and_orient(
             mesh,
             target_height=target_height,
             flatten_bottom=flatten_bottom,
             orientation=orientation
         )
+        if textured_mesh is not None:
+            textured_mesh = auto_ground_and_orient(
+                textured_mesh,
+                target_height=target_height,
+                flatten_bottom=False,
+                orientation=orientation
+            )
 
         # Step 3: Pedestal Base
         has_pedestal = False
