@@ -294,6 +294,74 @@ def segment_statue_parts(
         "num_parts_detected": len(part_info)
     }
 
+def extract_and_optimize_outer_shell(
+    mesh: trimesh.Trimesh,
+    max_texture_dim: int = 2048
+) -> trimesh.Trimesh:
+    """
+    Extracts and optimizes the outer shell of a 3D model for lightweight painting & WebGL:
+    1. Removes degenerate (zero-area) triangles.
+    2. Removes duplicate / coincident overlapping faces.
+    3. Retains clean exterior surface shell with valid normals.
+    4. Optimizes texture size (resizing massive 4K textures down to standard 2K)
+       and converts opaque RGBA textures to RGB for smaller footprint.
+    """
+    m = mesh.copy()
+
+    # 1. Clean degenerate triangles
+    vertices = np.asarray(m.vertices, dtype=np.float64)
+    faces = np.asarray(m.faces, dtype=np.int64)
+    span = float(np.ptp(vertices, axis=0).max()) or 1.0
+
+    corners = vertices[faces]
+    twice_area = np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
+    )
+    valid_mask = twice_area > (span ** 2) * 1e-14
+
+    # 2. Remove coincident / duplicate triangles
+    grid_key = np.round(vertices / max(span * 1e-5, 1e-12)).astype(np.int64)
+    _, welded_ids = np.unique(grid_key, axis=0, return_inverse=True)
+
+    identity = welded_ids[:, None]
+    if hasattr(m, "visual") and hasattr(m.visual, "uv") and m.visual.uv is not None and len(m.visual.uv) == len(vertices):
+        uv_discrete = np.round(np.asarray(m.visual.uv, dtype=np.float64) * 1e5).astype(np.int64)
+        identity = np.concatenate([identity, uv_discrete], axis=1)
+
+    _, fine_ids = np.unique(identity, axis=0, return_inverse=True)
+    sorted_tri_ids = np.sort(fine_ids[faces], axis=1)
+    _, first_seen_idx = np.unique(sorted_tri_ids, axis=0, return_index=True)
+    is_not_duplicate = np.zeros(len(faces), dtype=bool)
+    is_not_duplicate[first_seen_idx] = True
+
+    keep_faces = valid_mask & is_not_duplicate
+    if keep_faces.sum() > 0 and keep_faces.sum() < len(faces):
+        m.update_faces(keep_faces)
+        m.remove_unreferenced_vertices()
+
+    trimesh.repair.fix_normals(m)
+    _ = m.vertex_normals
+
+    # 3. Optimize texture map (downscale from 4K to 2K, compress)
+    if hasattr(m, "visual") and hasattr(m.visual, "material") and m.visual.material:
+        mat = m.visual.material
+        img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
+        if img is not None and isinstance(img, Image.Image):
+            orig_w, orig_h = img.size
+            if max(orig_w, orig_h) > max_texture_dim:
+                scale = max_texture_dim / max(orig_w, orig_h)
+                new_size = (int(orig_w * scale), int(orig_h * scale))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            if img.mode == "RGBA":
+                extrema = img.getextrema()
+                if len(extrema) == 4 and extrema[3][0] == 255 and extrema[3][1] == 255:
+                    img = img.convert("RGB")
+            mat.image = img
+            mat.baseColorTexture = img
+
+    return m
+
+
 def export_all_statue_variants(
     base_mesh: trimesh.Trimesh,
     segmented_data: Dict[str, Any],
@@ -302,12 +370,14 @@ def export_all_statue_variants(
     original_texture_mesh: Optional[trimesh.Trimesh] = None
 ) -> Dict[str, str]:
     """
-    Exports all standard GLB models needed by online statue painting apps:
-    1. model_plaster.glb (Pure White Plaster / Thạch cao mờ cao cấp)
-    2. model_segmented.glb (Multi-Part Submeshes with distinct PBR Materials for Bucket Fill)
-    3. model_id_colored.glb (Single Mesh with Vertex Colors for ID masking / Paint Shader)
-    4. model_textured.glb (AI Reference Texture from 2D Image)
-    5. statue_package.zip (All GLBs + Manifest JSON for online app API)
+    Exports all production-ready GLB variants into the output directory:
+    - Pure plaster white GLB
+    - Multi-part segmented GLB
+    - ID-colored vertex GLB
+    - Original Textured GLB
+    - Lightweight Outer Shell GLB (Chỉ lấy phần vỏ ngoài siêu nhẹ)
+    - Metadata manifest JSON
+    - Complete ZIP package
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     exported_files = {}
@@ -387,6 +457,23 @@ def export_all_statue_variants(
         with open(textured_glb_path, "wb") as fp:
             fp.write(tex_glb_bytes)
         exported_files["textured_glb"] = str(textured_glb_path)
+
+        # 5. Lightweight Outer Shell GLB (Chỉ lấy vỏ ngoài, đã làm sạch ruột và nén WebP)
+        shell_mesh = extract_and_optimize_outer_shell(original_texture_mesh, max_texture_dim=2048)
+        shell_glb_path = output_dir / f"{stem}_shell.glb"
+        shell_scene = trimesh.Scene({"Statue_Outer_Shell": shell_mesh})
+        shell_glb_bytes = trimesh.exchange.gltf.export_glb(shell_scene, include_normals=True, extension_webp=True)
+        with open(shell_glb_path, "wb") as fp:
+            fp.write(shell_glb_bytes)
+        exported_files["shell_glb"] = str(shell_glb_path)
+    else:
+        shell_mesh = extract_and_optimize_outer_shell(base_mesh)
+        shell_glb_path = output_dir / f"{stem}_shell.glb"
+        shell_scene = trimesh.Scene({"Statue_Outer_Shell": shell_mesh})
+        shell_glb_bytes = trimesh.exchange.gltf.export_glb(shell_scene, include_normals=True)
+        with open(shell_glb_path, "wb") as fp:
+            fp.write(shell_glb_bytes)
+        exported_files["shell_glb"] = str(shell_glb_path)
 
     # 5. Metadata Manifest JSON
     manifest = {

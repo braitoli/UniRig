@@ -1,3 +1,6 @@
 [submodule "3DPainting"]
 	path = 3DPainting
 	url = https://github.com/braitoli/3DPainting
+[submodule "FaceParsing"]
+	path = FaceParsing
+	url = https://github.com/braitoli/FaceParsing

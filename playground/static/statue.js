@@ -768,6 +768,7 @@ function initUIEvents() {
                 document.getElementById('dl-plaster').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_plaster.glb'), '_blank');
                 document.getElementById('dl-segmented').onclick = () => window.open(preset.model, '_blank');
                 document.getElementById('dl-textured').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_textured.glb'), '_blank');
+                document.getElementById('dl-shell').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_shell.glb'), '_blank');
             }
         });
     });
@@ -1185,6 +1186,7 @@ function onStatueJobCompleted(job) {
     document.getElementById('dl-plaster').href = `/api/statue/jobs/${job.id}/files/plaster_glb`;
     document.getElementById('dl-segmented').href = `/api/statue/jobs/${job.id}/files/segmented_glb`;
     document.getElementById('dl-textured').href = `/api/statue/jobs/${job.id}/files/textured_glb`;
+    document.getElementById('dl-shell').href = `/api/statue/jobs/${job.id}/files/shell_glb`;
     document.getElementById('dl-package').href = `/api/statue/jobs/${job.id}/files/package_zip`;
 
     // Update detected parts list
