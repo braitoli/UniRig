@@ -857,9 +857,20 @@ function initUIEvents() {
     });
     document.getElementById('btn-open-3dpainting-tab').addEventListener('click', () => {
         const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
-        const name = state.currentStatueName || 'Tượng 3D';
+        const name = state.currentStatueName || 'Tượng 3D UniRig';
         window.open(`/painting?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}`, '_blank');
     });
+
+    const iframeEl = document.getElementById('iframe-3dpainting');
+    if (iframeEl) {
+        iframeEl.addEventListener('load', () => {
+            const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
+            const name = state.currentStatueName || 'Tượng 3D UniRig';
+            try {
+                iframeEl.contentWindow?.postMessage({ type: 'LOAD_3D_MODEL', url, name }, '*');
+            } catch (e) {}
+        });
+    }
 
     // Automation Modal
     document.getElementById('btn-open-auto-modal').addEventListener('click', () => {
@@ -906,16 +917,16 @@ function syncModelTo3DPaintingIframe() {
     const iframe = document.getElementById('iframe-3dpainting');
     if (!iframe) return;
     const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
-    const name = state.currentStatueName || 'Tượng 3D';
+    const name = state.currentStatueName || 'Tượng 3D UniRig';
 
     const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}`;
-    if (!iframe.src || !iframe.src.includes(encodeURIComponent(url))) {
+    const currentSrc = iframe.getAttribute('src') || '';
+    if (!currentSrc || !currentSrc.includes(encodeURIComponent(url))) {
         iframe.src = targetSrc;
-    } else {
-        try {
-            iframe.contentWindow?.postMessage({ type: 'LOAD_3D_MODEL', url, name }, '*');
-        } catch (e) {}
     }
+    try {
+        iframe.contentWindow?.postMessage({ type: 'LOAD_3D_MODEL', url, name }, '*');
+    } catch (e) {}
 }
 
 function setPaintTool(tool) {
