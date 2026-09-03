@@ -103,6 +103,7 @@ class TestStatueOptimizer(unittest.TestCase):
             self.assertIn("segmented_glb", exported)
             self.assertIn("id_colored_glb", exported)
             self.assertIn("shell_glb", exported)
+            self.assertIn("shell_optimized_glb", exported)
             self.assertIn("manifest_json", exported)
             self.assertIn("package_zip", exported)
 

@@ -1139,6 +1139,9 @@ async def get_statue_file_endpoint(job_id: str, file_type: str):
         elif file_type in ("shell_glb", "shell"):
             matches = list(job_dir.glob("*_shell.glb"))
             if matches: target_path = matches[0]
+        elif file_type in ("shell_optimized_glb", "shell_optimized", "shell_opt"):
+            matches = list(job_dir.glob("*_shell_optimized.glb"))
+            if matches: target_path = matches[0]
         elif file_type == "rigged_glb":
             matches = list(job_dir.glob("*_rigged.glb")) or list(job_dir.glob("*_statue_rigged.glb"))
             if matches: target_path = matches[0]
