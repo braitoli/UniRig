@@ -308,36 +308,54 @@ def extract_and_optimize_outer_shell(
     """
     m = mesh.copy()
 
-    # 1. Clean degenerate triangles
-    vertices = np.asarray(m.vertices, dtype=np.float64)
-    faces = np.asarray(m.faces, dtype=np.int64)
-    span = float(np.ptp(vertices, axis=0).max()) or 1.0
+    # 1. Advanced Hidden & Interior Geometry Removal (via FaceParsing mesh_cleanup)
+    cleaned_by_faceparsing = False
+    try:
+        import sys
+        faceparsing_dir = Path(__file__).resolve().parent.parent / "FaceParsing"
+        if faceparsing_dir.exists() and str(faceparsing_dir) not in sys.path:
+            sys.path.insert(0, str(faceparsing_dir))
+        from app.mesh_cleanup import clean_mesh as faceparsing_clean_mesh
+        cleaned_mesh, report, _ = faceparsing_clean_mesh(m, remove_hidden=True, views=16, resolution=256)
+        if report.get("applied", False):
+            m = cleaned_mesh
+            cleaned_by_faceparsing = True
+            print(f"[StatueOptimizer] FaceParsing clean_mesh applied: removed {report.get('removed_faces', 0)} faces "
+                  f"({report.get('hidden', 0)} hidden, {report.get('degenerate', 0)} degen, {report.get('duplicate', 0)} dup), "
+                  f"patched {report.get('patched', 0)} faces.")
+    except Exception as err:
+        print(f"[StatueOptimizer] FaceParsing clean_mesh fallback ({err})")
 
-    corners = vertices[faces]
-    twice_area = np.linalg.norm(
-        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
-    )
-    valid_mask = twice_area > (span ** 2) * 1e-14
+    if not cleaned_by_faceparsing:
+        # Native fallback: Clean degenerate & duplicate triangles
+        vertices = np.asarray(m.vertices, dtype=np.float64)
+        faces = np.asarray(m.faces, dtype=np.int64)
+        span = float(np.ptp(vertices, axis=0).max()) or 1.0
 
-    # 2. Remove coincident / duplicate triangles
-    grid_key = np.round(vertices / max(span * 1e-5, 1e-12)).astype(np.int64)
-    _, welded_ids = np.unique(grid_key, axis=0, return_inverse=True)
+        corners = vertices[faces]
+        twice_area = np.linalg.norm(
+            np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
+        )
+        valid_mask = twice_area > (span ** 2) * 1e-14
 
-    identity = welded_ids[:, None]
-    if hasattr(m, "visual") and hasattr(m.visual, "uv") and m.visual.uv is not None and len(m.visual.uv) == len(vertices):
-        uv_discrete = np.round(np.asarray(m.visual.uv, dtype=np.float64) * 1e5).astype(np.int64)
-        identity = np.concatenate([identity, uv_discrete], axis=1)
+        grid_key = np.round(vertices / max(span * 1e-5, 1e-12)).astype(np.int64)
+        _, welded_ids = np.unique(grid_key, axis=0, return_inverse=True)
 
-    _, fine_ids = np.unique(identity, axis=0, return_inverse=True)
-    sorted_tri_ids = np.sort(fine_ids[faces], axis=1)
-    _, first_seen_idx = np.unique(sorted_tri_ids, axis=0, return_index=True)
-    is_not_duplicate = np.zeros(len(faces), dtype=bool)
-    is_not_duplicate[first_seen_idx] = True
+        identity = welded_ids[:, None]
+        if hasattr(m, "visual") and hasattr(m.visual, "uv") and m.visual.uv is not None and len(m.visual.uv) == len(vertices):
+            uv_discrete = np.round(np.asarray(m.visual.uv, dtype=np.float64) * 1e5).astype(np.int64)
+            identity = np.concatenate([identity, uv_discrete], axis=1)
 
-    keep_faces = valid_mask & is_not_duplicate
-    if keep_faces.sum() > 0 and keep_faces.sum() < len(faces):
-        m.update_faces(keep_faces)
-        m.remove_unreferenced_vertices()
+        _, fine_ids = np.unique(identity, axis=0, return_inverse=True)
+        sorted_tri_ids = np.sort(fine_ids[faces], axis=1)
+        _, first_seen_idx = np.unique(sorted_tri_ids, axis=0, return_index=True)
+        is_not_duplicate = np.zeros(len(faces), dtype=bool)
+        is_not_duplicate[first_seen_idx] = True
+
+        keep_faces = valid_mask & is_not_duplicate
+        if keep_faces.sum() > 0 and keep_faces.sum() < len(faces):
+            m.update_faces(keep_faces)
+            m.remove_unreferenced_vertices()
 
     trimesh.repair.fix_normals(m)
     _ = m.vertex_normals
