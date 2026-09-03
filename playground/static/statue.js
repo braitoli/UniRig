@@ -896,6 +896,8 @@ function setStudioEngine(engine) {
     const paintingBar = document.getElementById('painting-bar');
     const viewModes = document.getElementById('view-modes-container');
     const viewLabel = document.getElementById('view-mode-label');
+    const previewControls = document.getElementById('preview-controls-group');
+    const btnOpenTab = document.getElementById('btn-open-3dpainting-tab');
 
     if (is3D) {
         canvasContainer.style.display = 'none';
@@ -903,6 +905,8 @@ function setStudioEngine(engine) {
         iframeContainer.style.display = 'flex';
         viewModes.style.display = 'none';
         if (viewLabel) viewLabel.style.display = 'none';
+        if (previewControls) previewControls.style.display = 'none';
+        if (btnOpenTab) btnOpenTab.style.display = 'inline-flex';
         syncModelTo3DPaintingIframe();
     } else {
         canvasContainer.style.display = 'block';
@@ -910,6 +914,8 @@ function setStudioEngine(engine) {
         iframeContainer.style.display = 'none';
         viewModes.style.display = 'flex';
         if (viewLabel) viewLabel.style.display = 'inline-flex';
+        if (previewControls) previewControls.style.display = 'flex';
+        if (btnOpenTab) btnOpenTab.style.display = 'none';
     }
 }
 
@@ -919,7 +925,7 @@ function syncModelTo3DPaintingIframe() {
     const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
     const name = state.currentStatueName || 'Tượng 3D UniRig';
 
-    const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}`;
+    const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}&embedded=1`;
     const currentSrc = iframe.getAttribute('src') || '';
     if (!currentSrc || !currentSrc.includes(encodeURIComponent(url))) {
         iframe.src = targetSrc;
