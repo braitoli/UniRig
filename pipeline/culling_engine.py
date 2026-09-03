@@ -24,6 +24,7 @@ _BURIED_DEPTH = 5.0
 _CLUSTER_FLOOR = 120
 _PATCH_MAX_RIM = 256
 _PATCH_ROUNDS = 6
+_PATCH_ARRIVED_RIM = 8
 _MAX_REMOVED_SHARE = 0.5
 
 
@@ -247,9 +248,14 @@ def _fill_new_holes(
     present = set(map(tuple, seam_w))
 
     step: Dict[int, List[Tuple[int, int, int]]] = {}
+    arrived = set()
     for (wa, wb), (ra, rb) in zip(map(tuple, seam_w), map(tuple, seam_r)):
-        if (wb, wa) in present or (int(wb), int(wa)) in before:
+        if (wb, wa) in present:
             continue
+        rim_edge = (int(wb), int(wa))
+        if rim_edge in before:
+            # An opening the model arrived with. Closed as well, but only when small enough
+            arrived.add(rim_edge)
         step.setdefault(int(wb), []).append((int(wa), int(rb), int(ra)))
     if not step:
         return np.empty((0, 3), np.int64)
@@ -262,15 +268,21 @@ def _fill_new_holes(
                 continue
             used.add((origin, onward))
             corners = [first_real]
+            walked = [(origin, onward)]
             here, carried = onward, next_real
-            while here != origin and len(corners) <= rim:
+            while here != origin and len(corners) <= _PATCH_MAX_RIM:
                 corners.append(carried)
                 ahead = [o for o in step.get(here, []) if (here, o[0]) not in used]
                 if not ahead:
                     break
                 used.add((here, ahead[0][0]))
+                walked.append((here, ahead[0][0]))
                 here, carried = ahead[0][0], ahead[0][2]
-            if here == origin and 3 <= len(corners) <= rim:
+            if here != origin or len(corners) < 3:
+                continue
+            touches_own = any(edge in arrived for edge in walked)
+            allowed = _PATCH_ARRIVED_RIM if touches_own else rim
+            if len(corners) <= allowed:
                 for i in range(1, len(corners) - 1):
                     patch.append([corners[0], corners[i], corners[i + 1]])
     return np.asarray(patch, np.int64) if patch else np.empty((0, 3), np.int64)
