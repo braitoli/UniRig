@@ -67,3 +67,4 @@ tmp_*/
 external/
 temp_input_image.png
 tmp_*.glb
+tests/*.png

@@ -50,7 +50,7 @@ from scipy.spatial import cKDTree
 from .face_parsing import (BROW_LABELS, EYE_REGION_LABELS, FACE_LABELS, parse_faces,
                            region_mask)
 from .head_views import HeadViewRenderer, View, backproject_pixels, spiral_yaws
-from .mesh_segmentation import HeadRegion, mesh_edges, connected_region
+from .mesh_segmentation import HeadRegion, mesh_edges, connected_region, weld_mask
 
 # --- rendering ----------------------------------------------------------------------
 _RENDER_SIZE = 768
@@ -590,12 +590,20 @@ def _median_edge_length(vertices: np.ndarray, faces: np.ndarray, sample: int = 2
 
 def _mask_from_indices(vertex_idx: np.ndarray, n_vertices: int, edges: np.ndarray,
                        vertices: np.ndarray) -> np.ndarray:
-    """A per-vertex mask over one connected island of the given vertices."""
+    """
+    A per-vertex mask over one connected island of the given vertices.
+
+    Welded before it is returned, so the mask names positions rather than indices. A mirror
+    twin is built by a nearest-neighbour query, which returns one vertex per lookup and
+    therefore claims only one side of every UV seam it lands on; every consumer downstream
+    -- the frozen region, the feather around it -- then sees a mask with holes in it that
+    are invisible in the geometry.
+    """
     mask = np.zeros(n_vertices, dtype=bool)
     mask[vertex_idx] = True
     if not mask.any():
         return mask
-    return connected_region(mask, edges, vertices)
+    return weld_mask(connected_region(mask, edges, vertices), vertices)
 
 
 def _face_ball(

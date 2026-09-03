@@ -523,7 +523,7 @@ class FacialBlendshapesTransfer:
         t0 = time.time()
         
         # 1. Detect head region on target mesh (skeleton-guided if available)
-        from .mesh_segmentation import detect_head_region
+        from .mesh_segmentation import detect_head_region, weld_groups
         head = detect_head_region(vertices, faces)
         if head is None:
             print("[FacialBlendshapes] No head region detected; skipping blendshape transfer.")
@@ -669,17 +669,41 @@ class FacialBlendshapesTransfer:
         _inside = loc[_all_e] >= 0
         head_edges = loc[_all_e[_inside.all(axis=1)]]
         border_edges = _all_e[_inside[:, 0] ^ _inside[:, 1]]
-        degree = (np.bincount(head_edges[:, 0], minlength=M)
-                  + np.bincount(head_edges[:, 1], minlength=M)).astype(np.float64)
+
+        # The relaxation runs on the WELDED graph -- one node per position, not per index.
+        #
+        # Every weight handed to `smooth_weights` is a function of position alone: radial
+        # distance, distance to the fitted surface, a KD-tree feather. Coincident vertices
+        # therefore start out holding identical values. Relaxing over the raw index graph
+        # is what pulls them apart: a UV seam splits one point into copies that are NOT
+        # joined by an edge -- that is what a seam is -- so each copy averages only the
+        # triangles on its own side and after six passes they disagree. Every delta is
+        # then multiplied by a weight that differs across the seam, the two sides of the
+        # surface move by different amounts, and the mesh opens along the seam.
+        #
+        # That is not a rounding-level effect on this pipeline's own output. On a
+        # 4K-textured character 76% of all vertices are seam copies, and the face split
+        # along a network of cracks up to 1.6 median edges wide -- while every edge-based
+        # check stayed green, because an edge-based check cannot see two vertices that
+        # have no edge between them. Diffusing per position cannot give one point two
+        # answers, so the seams stay shut by construction.
+        weld = weld_groups(target_head_verts)
+        n_weld = int(weld.max()) + 1
+        weld_edges = weld[head_edges]
+        weld_edges = weld_edges[weld_edges[:, 0] != weld_edges[:, 1]]
+        weld_size = np.bincount(weld, minlength=n_weld).astype(np.float64)
+        degree = (np.bincount(weld_edges[:, 0], minlength=n_weld)
+                  + np.bincount(weld_edges[:, 1], minlength=n_weld)).astype(np.float64)
 
         def smooth_weights(w: np.ndarray, passes: int = 6) -> np.ndarray:
-            w = np.asarray(w, dtype=np.float64)
+            w = (np.bincount(weld, weights=np.asarray(w, dtype=np.float64), minlength=n_weld)
+                 / weld_size)
             for _ in range(passes):
                 neighbour_sum = (
-                    np.bincount(head_edges[:, 0], weights=w[head_edges[:, 1]], minlength=M)
-                    + np.bincount(head_edges[:, 1], weights=w[head_edges[:, 0]], minlength=M))
+                    np.bincount(weld_edges[:, 0], weights=w[weld_edges[:, 1]], minlength=n_weld)
+                    + np.bincount(weld_edges[:, 1], weights=w[weld_edges[:, 0]], minlength=n_weld))
                 w = np.where(degree > 0, 0.5 * w + 0.5 * neighbour_sum / np.maximum(degree, 1.0), w)
-            return w.astype(np.float32)
+            return w[weld].astype(np.float32)
 
         # Where `eyelid_patch` owns the geometry, the transfer has to hand over smoothly
         # instead of stopping dead. The caller zeroes every transferred delta on

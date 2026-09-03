@@ -204,10 +204,15 @@ def main():
     # measurement is per column -- the furthest-travelling vertex in each -- against the
     # eye's own opening height there, which the fixture defines analytically. Correlating
     # every vertex instead mixes in the hinge and measures nothing.
-    # The span is the EYE's half-width, not the lid's. The upper lid deliberately claims
-    # faces reaching past the outline so the seam cannot leak, and the analytic outline used
-    # below says nothing about columns outside the eye.
-    span = float(np.abs((v[left] - centre_l) @ across).max())
+    # The span is the ORBIT ELLIPSE's half-width. The lid is built over the ellipse
+    # `_orbit_region` fits around the eye, not over the painted eye itself -- the parser's
+    # mask is a sparse sample of the opening, and a lid confined to it covered 21% of the
+    # eye. So the outline that fixes the falloff is the ellipse's, and it is read off the
+    # region the patch protected rather than off the fixture's almond, which describes a
+    # lid an earlier design built.
+    orbit = result.protected[:len(v)] & (
+        np.linalg.norm(v - centre_l, axis=1) < 0.5 * regions.separation)
+    span = float(np.abs((v[orbit] - centre_l) @ across).max())
     within = np.abs(h_coord) <= span
     sel_mask = upper_sel & within
     h_sel, t_sel = h_coord[sel_mask], travel_l[sel_mask]
@@ -223,7 +228,7 @@ def main():
         edge_h.append(float(0.5 * (bin_edges[b] + bin_edges[b + 1])))
     edge_travel = np.asarray(edge_travel)
     edge_h = np.asarray(edge_h)
-    opening = np.sqrt(np.clip(1.0 - (edge_h / 0.30) ** 2, 0.0, 1.0))
+    opening = np.sqrt(np.clip(1.0 - (edge_h / span) ** 2, 0.0, 1.0))
     corr = float(np.corrcoef(edge_travel, opening)[0, 1]) if len(edge_travel) > 2 else 0.0
     check("the lid's leading edge follows the eye's outline", corr >= 0.75,
           f"correlation with opening height = {corr:.2f} over {len(edge_travel)} columns")
@@ -298,9 +303,14 @@ def main():
     check("gaze morphs were built", len(gaze) == 8, f"{len(gaze)}: {gaze}")
 
     protected = result.protected
+    # The frozen region is the eye OPENING plus every added piece, and the opening is the
+    # fitted ellipse -- which contains the parser's sample and is normally larger than it.
+    # Requiring equality with the sample, as this did, pins the check to the old design in
+    # which the lid could only ever cover the sampled vertices.
     check("the painted eye and every added piece are marked protected",
-          protected[n0:].all() and protected[:n0].sum() == int((left | right).sum()),
-          f"{int(protected.sum())} vertices ({int(protected[:n0].sum())} painted eye "
+          protected[n0:].all() and protected[:n0][left | right].all(),
+          f"{int(protected.sum())} vertices ({int(protected[:n0].sum())} eye opening, "
+          f"covering all {int((left | right).sum())} painted "
           f"+ {len(protected) - n0} added)")
 
     if gaze:
@@ -337,9 +347,18 @@ def main():
         check("eyeLookDown moves it the other way",
               float((down[moved].mean(axis=0)) @ up_l) < 0)
 
-        # It must not slide off the opening and onto the cheek.
-        centre_eye = v[left].mean(axis=0)
-        eye_reach = float(np.linalg.norm(v[left] - centre_eye, axis=1).max())
+        # It must not slide off the opening and onto the cheek. The opening is the region
+        # the patch itself built over -- the orbit ellipse, recoverable as the protected
+        # vertices around this eye -- rather than the parser's sample. That is the binding
+        # invariant: an iris that leaves the region the LIDS cover is an iris that stays
+        # visible through a closed eye, which is the defect this bound exists to prevent.
+        # Measuring against the sample instead bounds the gaze by a sparse subset of the
+        # eye, and on a real character that collapsed the travel to nothing -- eyeLookUp and
+        # eyeLookDown were not built at all.
+        eye_region = result.protected[:len(v)] & (
+            np.linalg.norm(v - v[left].mean(axis=0), axis=1) < 0.5 * regions.separation)
+        centre_eye = v[eye_region].mean(axis=0)
+        eye_reach = float(np.linalg.norm(v[eye_region] - centre_eye, axis=1).max())
         worst_reach = 0.0
         for name in gaze:
             if not name.endswith("Left"):

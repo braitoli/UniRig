@@ -61,7 +61,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from .eye_detection import EyeRegions
-from .mesh_segmentation import mesh_edges
+from .mesh_segmentation import mesh_edges, weld_groups, weld_mask
 
 # The upper lid covers this fraction of the eye's height and the lower lid takes the rest,
 # so the two meet low on the eye. Taken from the ratio rigs are built to: the top lid comes
@@ -102,7 +102,23 @@ _IRIS_LUMA_SPLIT = 0.55
 # A real eye behaves the same way -- the iris stays inside the palpebral fissure -- so the
 # limit is derived from how much room the opening actually leaves, then clamped here.
 _GAZE_MAX_DEG = 24.0
+# Fraction of the measured room the gaze is actually allowed to use.
+_GAZE_ROOM_SAFETY = 0.8
 _MIN_IRIS_VERTS = 6
+# A vertex inside the opening is painted eye rather than skin when its luminance sits this
+# many robust standard deviations from the skin ring's own, with a floor for a ring so
+# uniform that its deviation is nearly zero.
+_EYE_COLOUR_SIGMA = 3.0
+_EYE_COLOUR_FLOOR = 0.03
+# A colour-segmented iris is believed only when it spans between these fractions of the eye
+# opening. Outside them the segmentation has locked onto something that is not an iris, and
+# a disc of this proportion is used instead -- an iris is about 12mm across a 30mm opening.
+_IRIS_MIN_SHARE = 0.20
+_IRIS_MAX_SHARE = 0.80
+_IRIS_DISC_SHARE = 0.45
+# ...and it must fill this fraction of the disc its own reach implies, or it is a
+# thread rather than an iris.
+_IRIS_MIN_FILL = 0.5
 
 # AU5 upper lid raiser, on a face whose eye is paint: the opening itself cannot grow, so
 # what widens is the skin around it. The ring above the eye lifts and the ring below drops,
@@ -120,6 +136,44 @@ _CHEEK_BAND = 0.90
 
 _MIN_LID_FACES = 2
 _MIN_LID_VERTS = 6
+# How far the affine UV fit may miss the ring it was fitted to, as a fraction of the ring's
+# own UV extent, before the lid falls back to a single flat UV instead.
+_LID_UV_FIT_TOLERANCE = 0.25
+# ...and how much faster than the body's own UV-per-world rate the fitted map may run. Above
+# this it is not unwrapping the lid, it is racing between atlas islands.
+_LID_UV_MAX_GRADIENT = 2.0
+
+# --- the eye opening, as an ellipse rather than as the parser's vertex sample -----------
+# Half-axes are taken at this percentile of the mask's extent, not at its maximum: the mask
+# is sparse and occasionally holds one vertex up on the brow, and a maximum would stretch
+# the opening all the way to it.
+_ORBIT_PERCENTILE = 97.0
+# ...then grown by this much, so the lid covers the eye rather than stopping level with the
+# outermost sample. The lid is skin-coloured, so overshooting onto skin is invisible while
+# falling short leaves a rim of pupil showing.
+#
+# The value is bracketed from both sides by measurement, not chosen. Sweeping it on a
+# 4K-textured character, against the fraction of the eye still visible at full blink and
+# against whether the opening reached the parser's brow:
+#
+#     margin   eye still visible   brow vertices swallowed
+#      1.15          60.5%                    0
+#      1.30          17.2%                    0
+#      1.50          11.6%                    0
+#      1.75          11.7%                   19
+#      2.40          25.8%                  176
+#
+# Below 1.5 the lid stops short of the sclera; above it the opening starts eating the brow,
+# and past 2.0 coverage gets worse again -- an ellipse much larger than the eye puts the
+# closure line and the silhouette profile in the wrong place.
+_ORBIT_MARGIN = 1.50
+# How far from the eye's own plane a vertex may sit and still belong to the opening, as a
+# fraction of the larger half-axis. The ellipse is a projection; without this it also claims
+# the surface directly behind the eye.
+_ORBIT_DEPTH = 1.0
+# The ellipse has to land on the surface the parser labelled. Below this fraction of the
+# mask recovered, it did not, and the mask is used unchanged.
+_ORBIT_MIN_AGREEMENT = 0.5
 
 
 @dataclass
@@ -143,13 +197,22 @@ class EyelidResult:
     shape before the iris was given its own geometry."""
 
 
-def _dilate(mask: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """One-ring growth of a vertex mask across the edge graph."""
+def _dilate(mask: np.ndarray, edges: np.ndarray, groups: Optional[np.ndarray] = None
+            ) -> np.ndarray:
+    """
+    One-ring growth of a vertex mask across the edge graph.
+
+    Welded afterwards when `groups` is given. A single ring cannot cross a UV seam on its
+    own: the copies of a point there share no edge, so a copy whose own triangles are all
+    outside the mask stays outside while its twin comes in. The ring built from that
+    difference drives `eyeWide`, and a delta applied to one copy of a point and not the
+    other tore this character's eye open by 1.6 median edges.
+    """
     out = mask.copy()
     a, b = edges[:, 0], edges[:, 1]
     out[a[mask[b]]] = True
     out[b[mask[a]]] = True
-    return out
+    return out if groups is None else weld_mask(out, groups=groups)
 
 
 def eye_frame(points: np.ndarray, normals: np.ndarray, forward: np.ndarray
@@ -182,7 +245,107 @@ def eye_frame(points: np.ndarray, normals: np.ndarray, forward: np.ndarray
     return outward, up, across
 
 
-def _iris_mask(mask: np.ndarray, colors: Optional[np.ndarray], edges: np.ndarray) -> np.ndarray:
+def _orbit_region(vertices: np.ndarray, edges: np.ndarray, mask: np.ndarray,
+                  centre: np.ndarray, frame: Tuple[np.ndarray, np.ndarray, np.ndarray],
+                  groups: Optional[np.ndarray] = None,
+                  exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    The eye opening as a filled ellipse on the surface, recovered from a mask that only
+    samples it.
+
+    The parser's mask is a SAMPLE of the eye, not the eye. `_lift_blob` returns one vertex
+    per labelled PIXEL, so the mask's size is bounded by the render's resolution and has
+    nothing to do with how finely the mesh is tessellated. Measured on a 4K-textured
+    character: 76 labelled vertices where the opening actually spans 726, and since a lid
+    is copied from the faces of that mask, the lid covered 21% of the eye -- the sawtooth
+    patch of grey that showed through the middle of every blink.
+
+    What the mask does get right is WHERE the eye is and HOW BIG it is: the samples are
+    spread across the whole opening, merely sparse inside it. Those are the only two things
+    asked of it here. Which vertices belong to the eye -- the question it answers badly --
+    is answered instead by the ellipse those two quantities define, filled at the mesh's own
+    resolution.
+
+    The half-axes come from a percentile of the mask's extent rather than its maximum, so a
+    single vertex mislabelled up on the brow cannot stretch the opening into it. The result
+    is trimmed to one connected island because the ellipse is a projection and would
+    otherwise also claim whatever surface lies behind the eye.
+    """
+    from .mesh_segmentation import connected_region
+
+    outward, up, across = frame
+    rel = vertices - centre
+    h, u, w = rel @ across, rel @ up, rel @ outward
+
+    a = float(np.percentile(np.abs(h[mask]), _ORBIT_PERCENTILE)) * _ORBIT_MARGIN
+    b = float(np.percentile(np.abs(u[mask]), _ORBIT_PERCENTILE)) * _ORBIT_MARGIN
+    if a <= 1e-9 or b <= 1e-9:
+        return mask
+
+    inside = (((h / a) ** 2 + (u / b) ** 2) <= 1.0) & (np.abs(w) <= _ORBIT_DEPTH * max(a, b))
+    if exclude is not None:
+        # The brows come out of the same parsing pass and are the one feature the opening
+        # must never swallow: a lid built over the brow erases it for the whole blink.
+        # This is the safety catch for a character whose brow sits closer to the eye than
+        # the margin above assumes.
+        inside &= ~exclude
+    if not (inside & mask).any():
+        return mask
+
+    region = connected_region(inside, edges, vertices)
+    if region[mask].sum() < _ORBIT_MIN_AGREEMENT * mask.sum():
+        # The island the ellipse settled on is not the one the parser labelled. Nothing
+        # here is trustworthy enough to build a lid on a guess, so fall back to the mask.
+        return mask
+    return weld_mask(region, groups=groups) if groups is not None else region
+
+
+def _painted_eye(mask: np.ndarray, ring: np.ndarray,
+                 appearance: Optional[np.ndarray]) -> np.ndarray:
+    """
+    The eye's own paint inside the opening: whatever does not look like the skin around it.
+
+    Three different questions were being answered with one mask, and two got the wrong
+    answer. The parser's sample says WHERE the eye is. The orbit ellipse says how far a lid
+    must reach. But how far the iris may swing is a question about the PAINTED eye -- the
+    sclera it slides over -- and neither of those is that. Taking it from the sample made
+    `half_eye` and `half_iris` come out of the same sparse set of vertices, so the room
+    between them collapsed: `eyeLookUp`/`eyeLookDown` were not built at all, and In/Out came
+    out four times larger on one eye than on the other.
+
+    The skin reference is the ring immediately outside the opening, so it is local. An
+    earlier attempt to separate eye from skin by luminance failed because it calibrated
+    against the whole head and picked up hair and brows. The threshold is the ring's own
+    noise rather than a constant, since how far sclera sits from skin differs per character
+    -- on this one it is 0.055 of albedo.
+    """
+    if appearance is None or not ring.any():
+        return mask
+    rgb = appearance[:, :3].astype(np.float32)
+    if rgb.max() > 1.5:                       # 8-bit colour, as `sample_vertex_colors` bakes
+        rgb = rgb / 255.0
+    lum = rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+    # Skin and its noise come from the MIDDLE HALF of the ring. The ring is two rings of
+    # vertices out, so on a close-set face it catches brow and hair, and those drag a plain
+    # median-absolute-deviation up far enough to swallow the signal: measured here, the
+    # whole ring gave a deviation of 0.071 where sclera sits only 0.055 from skin, so the
+    # sclera was classified as skin and the eye came out as pupil alone.
+    ring_lum = lum[ring]
+    lo, hi = np.percentile(ring_lum, [25.0, 75.0])
+    core = ring_lum[(ring_lum >= lo) & (ring_lum <= hi)]
+    if len(core) < 4:
+        core = ring_lum
+    skin = float(np.median(core))
+    mad = float(np.median(np.abs(core - skin))) * 1.4826
+    threshold = max(_EYE_COLOUR_SIGMA * mad, _EYE_COLOUR_FLOOR)
+    paint = mask & (np.abs(lum - skin) > threshold)
+    return paint if paint.sum() >= _MIN_IRIS_VERTS else mask
+
+
+def _iris_mask(mask: np.ndarray, colors: Optional[np.ndarray], edges: np.ndarray,
+               vertices: Optional[np.ndarray] = None,
+               centre: Optional[np.ndarray] = None) -> np.ndarray:
     """
     The dark part of the eye -- iris and pupil -- as its own vertex mask.
 
@@ -206,7 +369,48 @@ def _iris_mask(mask: np.ndarray, colors: Optional[np.ndarray], edges: np.ndarray
     out[idx[dark]] = True
     if out.sum() < _MIN_IRIS_VERTS:
         return np.zeros(len(mask), dtype=bool)
-    return out
+
+    # Keep only the connected piece sitting in the MIDDLE of the eye. The docstring
+    # promised this and the code never did it, so the dark set also held the eyeliner ring
+    # around the outside of the eye. That put iris vertices out at the very rim, `half_iris`
+    # came out equal to `half_eye` to four decimal places, the room between them was zero,
+    # and the whole eyeLook family was silently skipped -- 0.0 degrees of travel.
+    #
+    # The piece is chosen by POSITION, not by darkness. On a character with drawn-on
+    # eyeliner that liner is darker than a brown iris, so picking the darkest component
+    # selects the lash line: measured, a 14-vertex sliver instead of the 400-vertex iris.
+    # An iris is the thing in the middle, which is a statement about where it is.
+    if vertices is None or centre is None:
+        return out
+
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    sel = np.nonzero(out)[0]
+    inner = edges[out[edges[:, 0]] & out[edges[:, 1]]]
+    if len(inner) == 0:
+        return out
+    loc = np.full(len(mask), -1, dtype=np.int64)
+    loc[sel] = np.arange(len(sel))
+    graph = coo_matrix((np.ones(len(inner), dtype=np.int8),
+                        (loc[inner[:, 0]], loc[inner[:, 1]])), shape=(len(sel), len(sel)))
+    n_comp, comp = connected_components(graph, directed=False)
+    if n_comp <= 1:
+        return out
+
+    best, best_d = None, np.inf
+    for c in range(n_comp):
+        members = sel[comp == c]
+        if len(members) < _MIN_IRIS_VERTS:
+            continue
+        d = float(np.linalg.norm(vertices[members].mean(axis=0) - centre))
+        if d < best_d:
+            best, best_d = members, d
+    if best is None:
+        return out
+    pupil = np.zeros(len(mask), dtype=bool)
+    pupil[best] = True
+    return pupil
 
 
 def _rotate_about(points: np.ndarray, pivot: np.ndarray, axis: np.ndarray, angle: float
@@ -283,7 +487,8 @@ def _profile_bins(h: np.ndarray, u: np.ndarray, w: np.ndarray, upper: bool
     return centres, prof_u, prof_w
 
 
-def _silhouette_profile(h: np.ndarray, u: np.ndarray, w: np.ndarray, upper: bool
+def _silhouette_profile(h: np.ndarray, u: np.ndarray, w: np.ndarray, upper: bool,
+                        sel: Optional[np.ndarray] = None
                         ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Where the eye's outline sits directly above (or below) each vertex.
@@ -295,7 +500,14 @@ def _silhouette_profile(h: np.ndarray, u: np.ndarray, w: np.ndarray, upper: bool
     corner vertex has almost nowhere to go, while a vertex at the centre travels the full
     height. That is the same falloff rigs paint in by hand.
     """
-    bins = _profile_bins(h, u, w, upper)
+    # The outline is traced over `sel` -- the eye itself -- and then evaluated for every
+    # vertex, including the ring outside it. A lid claims every face with any vertex in the
+    # eye, so its vertices spill one ring past the opening; letting that ring define the
+    # outline lifts the profile at exactly the columns where the opening is closing, and the
+    # corners then travel as far as the centre. Measured on the synthetic almond: corner
+    # travel 0.74 of the centre's against the 0.40 the outline implies.
+    hs, us, ws = (h, u, w) if sel is None else (h[sel], u[sel], w[sel])
+    bins = _profile_bins(hs, us, ws, upper)
     if bins is None:
         extreme = float(u.max() if upper else u.min())
         return np.full(len(h), extreme, np.float32), np.full(len(h), float(w.mean()), np.float32)
@@ -355,7 +567,7 @@ def _build_lid(
     # overshoot past that outline is a fraction of the lid's own span in that column, not of
     # the eye's overall height -- a constant overshoot is most of the travel at a corner
     # where there is barely any column left, and it was what kept the corners moving.
-    rest_u, rest_w = _silhouette_profile(h, u, w, upper=upper)
+    rest_u, rest_w = _silhouette_profile(h, u, w, upper=upper, sel=region[src_idx])
     rest_u = rest_u + (1.0 if upper else -1.0) * _LID_OVERSHOOT * np.abs(span[src_idx])
 
     travel = np.abs(rest_u - u)
@@ -394,6 +606,64 @@ def _build_lid(
             "closed": closed.astype(np.float32), "rest": rest.astype(np.float32)}
 
 
+def _lid_uvs(vertices: np.ndarray, uvs: np.ndarray, ring_idx: np.ndarray,
+             src_idx: np.ndarray, centre: np.ndarray,
+             frame: Tuple[np.ndarray, np.ndarray, np.ndarray],
+             body_uv_rate: float, appearance: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    UV for the lid, as a single affine map from the eye's own plane onto the atlas.
+
+    Per-vertex nearest-neighbour, which this used to do for the UV as well as the colour,
+    is NOT continuous. Two adjacent lid vertices can take their UV from two ring vertices
+    sitting on opposite sides of a UV seam -- and a seam is precisely where the atlas jumps
+    -- so the triangle between them sweeps clear across a 4K atlas and samples hair,
+    moustache and eye into what is meant to be a patch of skin. Measured on this character:
+    42% of lid edges travelled more than ten times the body's own UV-per-world rate, the
+    worst 3400x, and the lid rendered as a brown smear over the closed eye.
+
+    None of the other checks could see it. Colour baked per vertex interpolates smoothly
+    however wrong the UVs are, so every image this repo renders looked like clean skin.
+
+    An affine map cannot tear: it is continuous everywhere by construction, and where the
+    surface is unwrapped evenly -- which the body is, at a UV stretch of 0.2 with a p99 of
+    0.4 -- it also samples the right part of the atlas. Where the ring is itself split
+    across atlas islands the fit has no single answer, and rather than return a bad one it
+    falls back to one constant UV: a flat patch of skin, which is most of what an eyelid is.
+    """
+    _outward, up, across = frame
+    rel = vertices[ring_idx] - centre
+    basis = np.stack([rel @ across, rel @ up, np.ones(len(ring_idx))], axis=1)
+    target = uvs[ring_idx].astype(np.float64)
+    solution, *_ = np.linalg.lstsq(basis, target, rcond=None)
+
+    # Judge the fit by the quantity that actually matters: how fast it moves across the
+    # atlas per unit of surface. A residual test alone passes a map that fits a ring split
+    # over several atlas islands by racing between them -- measured, that still stretched
+    # the lid 31x the body's rate and painted it with the wrong part of the texture.
+    residual = float(np.median(np.linalg.norm(basis @ solution - target, axis=1)))
+    spread = max(float(np.ptp(target, axis=0).max()), 1e-9)
+    gradient = float(np.linalg.norm(solution[:2], axis=1).max())
+    if (residual <= _LID_UV_FIT_TOLERANCE * spread
+            and gradient <= _LID_UV_MAX_GRADIENT * body_uv_rate):
+        rel_src = vertices[src_idx] - centre
+        src_basis = np.stack(
+            [rel_src @ across, rel_src @ up, np.ones(len(src_idx))], axis=1)
+        return (src_basis @ solution).astype(np.float32)
+
+    # No usable map, so the whole lid takes ONE skin UV and renders flat. The vertex chosen
+    # is the ring vertex whose COLOUR is the most ordinary -- an actual point of skin, and
+    # the typical one. Picking by UV instead can land on a ring vertex that happens to sit
+    # on the eyeliner, and picking the median UV itself can land in empty atlas.
+    if appearance is not None:
+        lum = (appearance[ring_idx][:, :3].astype(np.float32)
+               @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32))
+        pick = ring_idx[int(np.argmin(np.abs(lum - float(np.median(lum)))))]
+    else:
+        median_uv = np.median(target, axis=0)
+        pick = ring_idx[int(np.argmin(np.linalg.norm(target - median_uv, axis=1)))]
+    return np.tile(uvs[pick], (len(src_idx), 1)).astype(np.float32)
+
+
 def _skin_colors(
     vertices: np.ndarray,
     edges: np.ndarray,
@@ -401,19 +671,23 @@ def _skin_colors(
     src_idx: np.ndarray,
     colors: Optional[np.ndarray],
     uvs: Optional[np.ndarray],
+    groups: Optional[np.ndarray] = None,
+    centre: Optional[np.ndarray] = None,
+    frame: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    body_uv_rate: float = 0.0,
+    appearance: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Colour and UV for the lid, taken from the ring of surface just outside the eye.
 
-    Per-vertex nearest-neighbour rather than one averaged tone, so a lid on a two-toned face
-    picks up the shading it sits in. The UV is carried across for the same reason: on a
-    textured export there is no COLOR_0 to fall back on, and a lid keeping the eye's own UV
-    would be painted with the pupil it is supposed to cover.
+    The COLOUR is per-vertex nearest-neighbour, so a lid on a two-toned face picks up the
+    shading it sits in; a vertex colour is interpolated directly, so a discontinuity in it
+    is at worst a visible edge. The UV cannot be treated the same way -- see `_lid_uvs`.
     """
     if colors is None and uvs is None:
         return None, None
 
-    ring = _dilate(_dilate(mask, edges), edges) & ~mask
+    ring = _dilate(_dilate(mask, edges, groups), edges, groups) & ~mask
     ring_idx = np.nonzero(ring)[0]
     if len(ring_idx) == 0:
         return (None if colors is None else colors[src_idx].copy(),
@@ -421,8 +695,12 @@ def _skin_colors(
 
     _, nearest = cKDTree(vertices[ring_idx]).query(vertices[src_idx], k=1)
     picked = ring_idx[nearest]
-    return (None if colors is None else colors[picked].copy(),
-            None if uvs is None else uvs[picked].copy())
+    lid_uvs = None
+    if uvs is not None:
+        lid_uvs = (_lid_uvs(vertices, uvs, ring_idx, src_idx, centre, frame,
+                            body_uv_rate, appearance)
+                   if centre is not None and frame is not None else uvs[picked].copy())
+    return (None if colors is None else colors[picked].copy(), lid_uvs)
 
 
 def _cheek_delta(
@@ -509,11 +787,24 @@ def attach_eyelids(
         appearance = colors
 
     edges = mesh_edges(faces, vertices)
+    # One id per position. Every vertex mask that ends up driving a delta is welded with
+    # it, so a UV seam cannot hand the two copies of a point different displacements.
+    groups = weld_groups(vertices)
     tri = faces if len(faces) <= 20000 else faces[np.linspace(0, len(faces) - 1, 20000).astype(np.int64)]
     edge_length = float(np.median(np.concatenate([
         np.linalg.norm(vertices[tri[:, 0]] - vertices[tri[:, 1]], axis=1),
         np.linalg.norm(vertices[tri[:, 1]] - vertices[tri[:, 2]], axis=1),
     ])))
+
+    # How fast the character's own unwrap moves across the atlas, so a lid's UV map can be
+    # judged against it rather than against an absolute number that depends on the unwrap.
+    body_uv_rate = 0.0
+    if uvs is not None and len(uvs) == n:
+        _d3 = np.linalg.norm(vertices[tri[:, 0]] - vertices[tri[:, 1]], axis=1)
+        _d2 = np.linalg.norm(uvs[tri[:, 0]] - uvs[tri[:, 1]], axis=1)
+        _ok = _d3 > 1e-12
+        if _ok.any():
+            body_uv_rate = float(np.median(_d2[_ok] / _d3[_ok]))
 
     new_vertices = [vertices.astype(np.float32)]
     new_faces = [faces.astype(np.int64)]
@@ -529,12 +820,30 @@ def attach_eyelids(
     widens: Dict[str, np.ndarray] = {}
     sclera_repaint: List[Tuple[np.ndarray, np.ndarray]] = []
     eye_centres = {"Left": None, "Right": None}
+    eye_masks: Dict[str, np.ndarray] = {}
+    brows = None
+    for _b in (eye_regions.left_brow_mask, eye_regions.right_brow_mask):
+        if _b is not None:
+            brows = _b.copy() if brows is None else (brows | _b)
 
-    for side, mask in (("Left", eye_regions.left_mask), ("Right", eye_regions.right_mask)):
-        idx = np.nonzero(mask)[0]
-        if len(idx) < _MIN_LID_VERTS:
+    for side, sample in (("Left", eye_regions.left_mask), ("Right", eye_regions.right_mask)):
+        seed = np.nonzero(sample)[0]
+        if len(seed) < _MIN_LID_VERTS:
             print(f"[EyelidPatch] {side} eye has too few vertices to copy a lid from.")
             continue
+
+        # The parser's sample gives the eye's centre and its axes -- the two quantities it
+        # is reliable about -- and those define the ellipse that gives the opening itself.
+        # Everything below is built on the opening, never on the sample.
+        mask = _orbit_region(
+            vertices, edges, sample,
+            vertices[seed].mean(axis=0).astype(np.float32),
+            eye_frame(vertices[seed], vertex_normals[seed], eye_regions.forward),
+            groups, brows)
+        eye_masks[side] = mask
+        idx = np.nonzero(mask)[0]
+        print(f"[EyelidPatch] {side} eye: parser sampled {len(seed)} vertices, "
+              f"orbit ellipse covers {len(idx)}.")
 
         centre = vertices[idx].mean(axis=0).astype(np.float32)
         frame = eye_frame(vertices[idx], vertex_normals[idx], eye_regions.forward)
@@ -590,8 +899,60 @@ def attach_eyelids(
 
         eye_centres[side] = centre
 
+        # The ring of skin just outside the opening, taken here rather than further down
+        # because it is what calibrates skin colour for `_painted_eye`.
+        ring = _dilate(_dilate(mask, edges, groups), edges, groups) & ~mask
+        ring_idx = np.nonzero(ring)[0]
+        paint = _painted_eye(mask, ring, appearance)
+
         # --- the iris, lifted off the face so it can rotate instead of being stretched ---
-        iris = _iris_mask(mask, appearance, edges)
+        # Read off the PAINTED eye, not off the ellipse and not off the parser's sample.
+        # The ellipse deliberately reaches onto plain skin, so splitting that on luminance
+        # puts the darkest skin around the eye into the cap; the sample is too sparse to
+        # leave any room between the iris and the eye that bounds its travel.
+        iris = _iris_mask(paint, appearance, edges, vertices, centre)
+
+        # How wide the eye opening is: the orbit ellipse's own extent.
+        #
+        # Not the parser's sample and not a colour segmentation, because neither measures
+        # the opening. The sample is a sparse subset of it -- 76 vertices where the eye
+        # spans 780 -- and colour cannot find its edge at all on this character: sclera sits
+        # 0.055 of albedo from skin, and the painted region recovered by luminance came back
+        # the same size as the sample. The ellipse is the only estimate that was checked
+        # against what a viewer sees, by sweeping its margin against how much eye survives a
+        # blink, so it is the one used here too.
+        opening_rel = vertices[idx] - centre
+        half_open = {"up": float(np.abs(opening_rel @ up).max()),
+                     "across": float(np.abs(opening_rel @ across_axis).max())}
+
+        # An iris segmented out of colour is only believable when it comes back the size an
+        # iris is. On this character it did not: the eyeliner is darker than the brown iris,
+        # so the dark region is a ring plus a disc, and depending on which of them was
+        # picked the "iris" was either the whole eye -- leaving no room to move, so the
+        # entire eyeLook family was skipped -- or a 14-vertex sliver of lash line. Where the
+        # measurement is not credible, fall back to the anatomical proportion: an iris is
+        # about 12mm across an opening of about 30mm.
+        iris_rel = vertices[np.nonzero(iris)[0]] - centre if iris.any() else None
+        credible = iris_rel is not None and all(
+            _IRIS_MIN_SHARE * half_open[k] <= float(np.abs(iris_rel @ ax).max())
+            <= _IRIS_MAX_SHARE * half_open[k]
+            for k, ax in (("up", up), ("across", across_axis)))
+        if credible:
+            # ...and it has to be a disc, not a thread. Extent alone passes a sliver of
+            # lash line running the width of the eye: measured, 14 vertices where a disc of
+            # that reach holds several hundred.
+            reach = max(float(np.abs(iris_rel @ up).max()),
+                        float(np.abs(iris_rel @ across_axis).max()))
+            span = max(half_open["up"], half_open["across"], 1e-9)
+            expected = mask.sum() * (reach / span) ** 2
+            credible = iris.sum() >= _IRIS_MIN_FILL * max(expected, 1.0)
+        if not credible:
+            plane = np.sqrt(((vertices - centre) @ across_axis) ** 2
+                            + ((vertices - centre) @ up) ** 2)
+            iris = mask & (plane <= _IRIS_DISC_SHARE * max(half_open["up"],
+                                                           half_open["across"]))
+            print(f"[EyelidPatch] {side} eye: iris segmentation not credible, using a disc "
+                  f"of {int(iris.sum())} vertices.")
         iris_faces = faces[iris[faces].sum(axis=1) == 3]
         if len(iris_faces) >= _MIN_LID_FACES and appearance is not None:
             iris_idx = np.unique(iris_faces.ravel())
@@ -600,8 +961,11 @@ def attach_eyelids(
             # is what keeps the iris a circle no matter where it is looking.
             pivot = (centre - outward * radius).astype(np.float32)
             iris_rel = vertices[iris_idx] - centre
-            half_eye = {"up": float(np.abs(u_eye).max()),
-                        "across": float(np.abs(h_eye).max())}
+            # How much room the iris has is set by the EYE OPENING the character was
+            # painted with -- the parser's sample -- not by the orbit ellipse. The ellipse
+            # reaches out onto plain skin on purpose, and measuring the room against it
+            # lets the gaze swing the iris clean off the eye and onto the cheek.
+            half_eye = half_open
             half_iris = {"up": float(np.abs(iris_rel @ up).max()),
                          "across": float(np.abs(iris_rel @ across_axis).max())}
             irises.append({
@@ -613,14 +977,14 @@ def attach_eyelids(
             # under the cap is safe because the cap covers exactly that patch at rest, so
             # nothing about the character's appearance changes until it looks somewhere.
             if colors is not None:
-                eye_rgb = colors[idx][:, :3].astype(np.float32)
+                paint_idx = np.nonzero(paint)[0]
+                eye_rgb = colors[paint_idx][:, :3].astype(np.float32)
                 luma = eye_rgb @ np.array([0.2126, 0.7152, 0.0722], np.float32)
-                sclera = colors[idx][np.argsort(luma)[-max(1, len(idx) // 8):]].mean(axis=0)
+                sclera = colors[paint_idx][
+                    np.argsort(luma)[-max(1, len(paint_idx) // 8):]].mean(axis=0)
                 sclera_repaint.append((iris_idx, sclera.astype(colors.dtype)))
 
         # --- AU5: widen the opening by moving the skin around it, never the eye itself ---
-        ring = _dilate(_dilate(mask, edges), edges) & ~mask
-        ring_idx = np.nonzero(ring)[0]
         if len(ring_idx) >= _MIN_LID_VERTS:
             eye_h = float(np.ptp(u_eye)) or 1e-6
             ring_u = (vertices[ring_idx] - centre) @ up
@@ -643,7 +1007,8 @@ def attach_eyelids(
             new_normals.append(vertex_normals[src_idx].copy())
             if new_weights is not None:
                 new_weights.append(skin_weights[src_idx].copy())
-            lid_colors, lid_uvs = _skin_colors(vertices, edges, mask, src_idx, colors, uvs)
+            lid_colors, lid_uvs = _skin_colors(vertices, edges, mask, src_idx, colors, uvs, groups,
+                                               centre, frame, body_uv_rate, appearance)
             if new_colors is not None:
                 new_colors.append(lid_colors)
             if new_uvs is not None:
@@ -664,6 +1029,13 @@ def attach_eyelids(
 
     if not built:
         return None
+
+    # Every painted eye on the face. AU5 moves the skin AROUND the opening, so it has to
+    # avoid all of them, not merely the one whose ring it was built from -- on a face whose
+    # eyes sit close together the ring of one reaches into the other.
+    painted = np.zeros(n, dtype=bool)
+    for _m in eye_masks.values():
+        painted |= _m
 
     # --- weld each iris on as its own cap, floating just clear of the sclera ---
     for iris in irises:
@@ -719,6 +1091,7 @@ def attach_eyelids(
     for side, delta in widens.items():
         padded = blank()
         padded[:n] = delta
+        padded[:n][painted] = 0.0
         morph_targets[f"eyeWide{side}"] = padded
 
     # --- gaze: rigid rotation of the iris cap about the eyeball centre ---
@@ -741,7 +1114,12 @@ def attach_eyelids(
         # than a fudge factor: the room left over, divided by the eyeball's radius, is an
         # angle.
         def limit(axis_key: str) -> float:
+            # The room is taken with a margin because both radii are measured along the
+            # eye's own axes while the cap travels on a sphere: at a diagonal the cap's
+            # corner reaches further than either axis says, and without the margin it
+            # overshot the region the lids cover by 13%.
             room = max(iris["half_eye"][axis_key] - iris["half_iris"][axis_key], 0.0)
+            room *= _GAZE_ROOM_SAFETY
             return float(min(room / max(iris["radius"], 1e-9), np.radians(_GAZE_MAX_DEG)))
 
         directions = {
@@ -786,7 +1164,8 @@ def attach_eyelids(
 
     protected = np.zeros(total, dtype=bool)
     protected[n:] = True                                   # every lid and iris vertex
-    protected[:n] = eye_regions.left_mask | eye_regions.right_mask
+    protected[:n] = painted if eye_masks else (
+        eye_regions.left_mask | eye_regions.right_mask)
 
     added = total - n
     lids_report = ", ".join(f"{l['side']}/{'upper' if l['upper'] else 'lower'}" for l in built)

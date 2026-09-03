@@ -21,9 +21,12 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from pipeline.unirig_pipeline import UniRigPipeline
+from pipeline.statue_pipeline import Statue3DPipeline
+from pipeline.statue_optimizer import STATUE_PALETTE
 from playground import database
+from playground.automation_service import StatueAutomationService, test_webhook_endpoint
 
-app = FastAPI(title="UniRig 3D Rigging Playground")
+app = FastAPI(title="UniRig 3D Rigging & Statue Painting Playground")
 
 # Enable CORS for LAN access
 app.add_middleware(
@@ -40,9 +43,12 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 # Mount static files
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/examples", StaticFiles(directory=str(ROOT_DIR / "examples")), name="examples")
 
 database.init_db()
 pipeline_runner = UniRigPipeline(root_dir=str(ROOT_DIR))
+statue_runner = Statue3DPipeline(root_dir=str(ROOT_DIR))
+automation_service = StatueAutomationService(server_port=7860)
 
 
 def ensure_trellis_worker_background():
@@ -65,6 +71,9 @@ def ensure_trellis_worker_background():
 async def server_startup():
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, ensure_trellis_worker_background)
+    cfg = database.get_automation_config()
+    if cfg.get("enabled", False):
+        automation_service.start()
 
 
 def get_lan_ips() -> List[str]:
@@ -300,7 +309,7 @@ def run_job_background(job_id: str):
             metadata={"traceback": tb}
         )
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def serve_index():
     index_file = STATIC_DIR / "index.html"
     return HTMLResponse(
@@ -849,6 +858,279 @@ async def get_facial_blendshapes_presets():
         "blendshapes": ARKIT_BLENDSHAPES,
         "presets": EXPRESSION_PRESETS
     }
+
+# ==========================================
+# 🎨 3D Statue Painting & Automation Endpoints
+# ==========================================
+
+def run_statue_job_background(job_id: str):
+    """Executes the complete automated 3D statue painting pipeline in background."""
+    job = database.get_statue_job(job_id)
+    if not job:
+        return
+    
+    t_start = time.time()
+    job_dir = STORAGE_DIR / f"statue_jobs/{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    input_file = job["input_file_path"]
+    metadata = job.get("metadata", {})
+    
+    def on_progress(pct: int, step_name: str, step_idx: int, total_steps: int):
+        metadata["progress"] = {
+            "pct": pct,
+            "step_name": step_name,
+            "step_idx": step_idx,
+            "total_steps": total_steps
+        }
+        database.update_statue_job(job_id, status="processing", metadata=metadata)
+        
+    try:
+        on_progress(5, "Đang khởi tạo pipeline tạo tượng 3D...", 1, 5)
+        res = statue_runner.process_statue(
+            input_path=input_file,
+            output_dir=str(job_dir),
+            job_id=job_id,
+            generator_type=job.get("generator_type", "trellis"),
+            mesh_detail=job.get("mesh_detail", "high"),
+            texture_detail=job.get("texture_detail", "high"),
+            target_faces=int(job.get("target_faces", 50000)),
+            pedestal_shape=job.get("pedestal_shape", "round"),
+            enable_rigging=bool(job.get("enable_rigging", 0)),
+            progress_callback=on_progress
+        )
+        
+        metadata["files"] = res.get("files", {})
+        metadata["mesh_stats"] = res.get("mesh_stats", {})
+        metadata["progress"] = {
+            "pct": 100,
+            "step_name": "Tượng 3D đã hoàn thành sẵn sàng cho ứng dụng tô tượng!",
+            "step_idx": 5,
+            "total_steps": 5
+        }
+        
+        database.update_statue_job(
+            job_id,
+            status="completed",
+            duration_sec=res.get("duration_sec", 0.0),
+            num_vertices=res.get("mesh_stats", {}).get("num_vertices", 0),
+            num_faces=res.get("mesh_stats", {}).get("num_faces", 0),
+            num_parts=res.get("mesh_stats", {}).get("num_parts", 0),
+            metadata=metadata
+        )
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"Error in statue job {job_id}:\n{tb}")
+        database.update_statue_job(
+            job_id,
+            status="failed",
+            error_message=str(e),
+            metadata={"traceback": tb, "progress": {"pct": 100, "step_name": f"Lỗi: {e}"}}
+        )
+
+@app.api_route("/statue", methods=["GET", "HEAD"], response_class=HTMLResponse)
+@app.api_route("/statue-studio", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def serve_statue_studio():
+    statue_file = STATIC_DIR / "statue.html"
+    if not statue_file.exists():
+        raise HTTPException(status_code=404, detail="Statue studio page not found")
+    return HTMLResponse(
+        content=statue_file.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"}
+    )
+
+@app.post("/api/statue/generate")
+async def create_statue_generation_job(
+    file: UploadFile = File(...),
+    generator: str = Form("trellis"),
+    mesh_detail: str = Form("high"),
+    texture_detail: str = Form("high"),
+    target_faces: int = Form(50000),
+    pedestal_shape: str = Form("round"),
+    enable_rigging: bool = Form(False),
+    seed: int = Form(42),
+    background_tasks: BackgroundTasks = None
+):
+    stem = Path(file.filename).stem
+    clean_stem = re.sub(r'[^a-zA-Z0-9_-]', '_', stem)
+    job_id = f"statue_{int(time.time())}_{clean_stem}"
+    job_dir = STORAGE_DIR / f"statue_jobs/{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    clean_suffix = Path(file.filename).suffix.lower()
+    clean_filename = f"{clean_stem}{clean_suffix}"
+    target_input = job_dir / clean_filename
+    with open(target_input, "wb") as f:
+        content = await file.read()
+        f.write(content)
+        
+    metadata = {
+        "original_filename": file.filename,
+        "seed": seed,
+        "progress": {"pct": 5, "step_name": "Đã đưa vào hàng đợi xử lý...", "step_idx": 1, "total_steps": 5}
+    }
+    job = database.create_statue_job(
+        job_id=job_id,
+        title=f"Statue: {file.filename}",
+        input_filename=clean_filename,
+        input_file_path=str(target_input),
+        generator_type=generator,
+        mesh_detail=mesh_detail,
+        texture_detail=texture_detail,
+        target_faces=target_faces,
+        pedestal_shape=pedestal_shape,
+        enable_rigging=enable_rigging,
+        is_automated=False,
+        metadata=metadata
+    )
+    
+    background_tasks.add_task(run_statue_job_background, job_id)
+    return job
+
+@app.get("/api/statue/jobs")
+async def list_all_statue_jobs(limit: int = 50, automated: Optional[bool] = None):
+    jobs = database.list_statue_jobs(limit=limit, automated_only=automated)
+    return JSONResponse(
+        content=jobs,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"}
+    )
+
+@app.get("/api/statue/jobs/{job_id}")
+async def get_statue_job_endpoint(job_id: str):
+    job = database.get_statue_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Statue job not found")
+    return JSONResponse(
+        content=job,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"}
+    )
+
+@app.delete("/api/statue/jobs/{job_id}")
+async def delete_statue_job_endpoint(job_id: str):
+    job = database.get_statue_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Statue job not found")
+    database.delete_statue_job(job_id)
+    job_dir = STORAGE_DIR / f"statue_jobs/{job_id}"
+    if job_dir.exists():
+        shutil.rmtree(str(job_dir), ignore_errors=True)
+    return {"status": "deleted", "job_id": job_id}
+
+@app.api_route("/api/statue/jobs/{job_id}/files/{file_type}", methods=["GET", "HEAD"])
+async def get_statue_file_endpoint(job_id: str, file_type: str):
+    job = database.get_statue_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Statue job not found")
+        
+    job_dir = STORAGE_DIR / f"statue_jobs/{job_id}"
+    metadata = job.get("metadata", {})
+    files_map = metadata.get("files", {})
+    
+    target_path = None
+    if file_type in files_map:
+        p = Path(files_map[file_type])
+        if p.exists():
+            target_path = p
+            
+    if target_path is None:
+        # Fallbacks by glob pattern
+        if file_type == "plaster_glb":
+            matches = list(job_dir.glob("*_plaster.glb"))
+            if matches: target_path = matches[0]
+        elif file_type == "segmented_glb":
+            matches = list(job_dir.glob("*_segmented.glb"))
+            if matches: target_path = matches[0]
+        elif file_type == "id_colored_glb":
+            matches = list(job_dir.glob("*_id_colored.glb"))
+            if matches: target_path = matches[0]
+        elif file_type == "textured_glb":
+            matches = list(job_dir.glob("*_textured.glb")) or list(job_dir.glob("stage0_*/*.glb"))
+            if matches: target_path = matches[0]
+        elif file_type == "rigged_glb":
+            matches = list(job_dir.glob("*_rigged.glb")) or list(job_dir.glob("*_statue_rigged.glb"))
+            if matches: target_path = matches[0]
+        elif file_type == "manifest_json":
+            matches = list(job_dir.glob("*_manifest.json"))
+            if matches: target_path = matches[0]
+        elif file_type == "package_zip":
+            matches = list(job_dir.glob("*_statue_package.zip"))
+            if matches: target_path = matches[0]
+        elif file_type == "input_image":
+            p = Path(job.get("input_file_path", ""))
+            if p.exists(): target_path = p
+            
+    if target_path is None or not target_path.exists():
+        raise HTTPException(status_code=404, detail=f"Requested file '{file_type}' not found for job {job_id}")
+        
+    stem = Path(job["input_filename"]).stem
+    if target_path.suffix.lower() == ".glb":
+        return FileResponse(str(target_path), media_type="model/gltf-binary", filename=f"{stem}_{file_type}.glb")
+    elif target_path.suffix.lower() == ".zip":
+        return FileResponse(str(target_path), media_type="application/zip", filename=f"{stem}_statue_package.zip")
+    elif target_path.suffix.lower() == ".json":
+        return FileResponse(str(target_path), media_type="application/json", filename=f"{stem}_manifest.json")
+    elif target_path.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]:
+        return FileResponse(str(target_path), media_type=f"image/{target_path.suffix.lower().removeprefix('.')}")
+    else:
+        return FileResponse(str(target_path))
+
+@app.get("/api/statue/palette")
+async def get_statue_palette_endpoint():
+    return {
+        "palette": STATUE_PALETTE,
+        "recommended_tools": ["bucket_fill", "brush", "eraser"],
+        "material_presets": [
+            {"id": "plaster", "name": "Thạch cao mờ (Gypsum Plaster)", "roughness": 0.88, "metalness": 0.02},
+            {"id": "ceramic_glossy", "name": "Gốm sứ tráng men (Glossy Ceramic)", "roughness": 0.18, "metalness": 0.08},
+            {"id": "clay", "name": "Đất sét nung (Terracotta Clay)", "roughness": 0.75, "metalness": 0.0},
+            {"id": "metallic_gold", "name": "Mạ vàng kim (Gold Leaf Accent)", "roughness": 0.25, "metalness": 0.95}
+        ]
+    }
+
+# --- Automation & Webhook Endpoints ---
+
+@app.get("/api/statue/automation/status")
+async def get_automation_status_endpoint():
+    return automation_service.get_status()
+
+@app.get("/api/statue/automation/config")
+async def get_automation_config_endpoint():
+    return database.get_automation_config()
+
+@app.post("/api/statue/automation/config")
+async def update_automation_config_endpoint(config_data: Dict[str, Any]):
+    updated = database.update_automation_config(config_data)
+    # Restart or start worker if enabled changed
+    if updated.get("enabled", False) and not automation_service.is_running:
+        automation_service.start()
+    elif not updated.get("enabled", False) and automation_service.is_running:
+        automation_service.stop()
+    return updated
+
+@app.post("/api/statue/automation/toggle")
+async def toggle_automation_endpoint():
+    cfg = database.get_automation_config()
+    new_state = not cfg.get("enabled", False)
+    database.update_automation_config({"enabled": new_state})
+    if new_state:
+        automation_service.start()
+    else:
+        automation_service.stop()
+    return {"enabled": new_state, "is_running": automation_service.is_running}
+
+@app.post("/api/statue/automation/scan-now")
+async def trigger_scan_now_endpoint():
+    found_files = automation_service.trigger_scan_now()
+    return {"status": "triggered", "found_files": found_files, "count": len(found_files)}
+
+@app.post("/api/statue/automation/test-webhook")
+async def test_webhook_api_endpoint(data: Dict[str, Any]):
+    url = data.get("webhook_url", "").strip()
+    secret = data.get("webhook_secret", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Vui lòng cung cấp webhook_url để kiểm tra kết nối")
+    return test_webhook_endpoint(url=url, secret=secret)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))

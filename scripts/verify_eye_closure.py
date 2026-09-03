@@ -36,6 +36,8 @@ sys.path.insert(0, str(ROOT))
 
 COVERAGE_LIMIT = 0.15   # of the eye may still be showing at full blink
 RAGGED_LIMIT = 4.0      # perimeter^2 / (4*pi*area) of whatever is still showing
+UV_STRETCH_LIMIT = 3.0  # x the body's own p99. Above this the lid samples the atlas
+                        # somewhere other than the skin it is supposed to be made of.
 
 
 def camera(centre, forward, radius, size):
@@ -101,6 +103,48 @@ def eye_pixels(image, skin_luma):
     return sclera | iris
 
 
+def uv_stretch(vertices, faces, uvs, tris):
+    """How far a triangle's edges travel across the ATLAS per unit of real surface."""
+    a3 = np.linalg.norm(vertices[tris[:, 0]] - vertices[tris[:, 1]], axis=1)
+    b3 = np.linalg.norm(vertices[tris[:, 1]] - vertices[tris[:, 2]], axis=1)
+    a2 = np.linalg.norm(uvs[tris[:, 0]] - uvs[tris[:, 1]], axis=1)
+    b2 = np.linalg.norm(uvs[tris[:, 1]] - uvs[tris[:, 2]], axis=1)
+    ok = (a3 > 1e-12) & (b3 > 1e-12)
+    if not ok.any():
+        return np.zeros(1)
+    return np.concatenate([a2[ok] / a3[ok], b2[ok] / b3[ok]])
+
+
+def check_lid_uvs(lids, n_original):
+    """
+    Whether the lid's UVs are continuous enough to sample the texture as skin.
+
+    This is invisible to every other measurement here, and that is exactly why it exists.
+    The images above are rendered from colour baked PER VERTEX, which interpolates smoothly
+    no matter where each vertex's UV points; a real renderer interpolates the UV itself and
+    samples the atlas along the way. A lid whose neighbouring vertices carry UVs from
+    opposite corners of a 4K atlas therefore looks like clean skin in this script and like a
+    smear of hair, moustache and eye in the viewer -- which is what the playground showed
+    while this script reported 9% coverage.
+
+    Measured against the body's own stretch rather than an absolute number, since the figure
+    depends entirely on how the character happens to be unwrapped.
+    """
+    if lids.uvs is None:
+        return None
+    lid_faces = lids.faces[(lids.faces >= n_original).any(axis=1)]
+    body_faces = lids.faces[(lids.faces < n_original).all(axis=1)]
+    if len(lid_faces) == 0 or len(body_faces) == 0:
+        return None
+    body = uv_stretch(lids.vertices, lids.faces, lids.uvs, body_faces)
+    lid = uv_stretch(lids.vertices, lids.faces, lids.uvs, lid_faces)
+    ref = max(float(np.percentile(body, 99)), 1e-12)
+    return {"ratio": float(np.percentile(lid, 99)) / ref,
+            "lid_p99": float(np.percentile(lid, 99)),
+            "body_p99": ref,
+            "torn": float(np.mean(lid > 10.0 * max(float(np.median(body)), 1e-12)))}
+
+
 def raggedness(mask):
     """perimeter^2 / (4*pi*area), 1.0 for a disc. Higher means a more broken outline."""
     area = int(mask.sum())
@@ -138,8 +182,22 @@ def run(path: Path, save_dir: Path):
         print("    no eyelids built"); return None
 
     base_colors = appearance if appearance is not None else colors
-    lid_colors = lids.colors if lids.colors is not None else np.vstack([
-        base_colors, np.tile(base_colors.mean(axis=0).astype(np.uint8), (lids.n_added, 1))])
+    if lids.colors is not None:
+        lid_colors = lids.colors
+    elif lids.uvs is not None and texture is not None:
+        # A textured character carries no COLOR_0, so the lid's colour lives in the UVs it
+        # inherited from the ring of skin outside the eye. Bake the texture down through
+        # those UVs to see what the lid will actually look like.
+        #
+        # The third measurement bug of this kind, and the same shape as the first two:
+        # painting the added vertices with `base_colors.mean()` -- the average of the whole
+        # character, hair and moustache and clothing included -- put a mid-grey lid over
+        # the eye, and `eye_pixels` then counted that lid as iris because it is darker than
+        # skin. A lid covering the eye perfectly scored as an eye still fully exposed.
+        lid_colors = sample_vertex_colors(lids.vertices, lids.faces, lids.uvs, texture)
+    else:
+        lid_colors = np.vstack([
+            base_colors, np.tile(base_colors.mean(axis=0).astype(np.uint8), (lids.n_added, 1))])
 
     centre = (vertices[regions.left_mask].mean(axis=0)
               + vertices[regions.right_mask].mean(axis=0)) / 2.0
@@ -187,6 +245,11 @@ def run(path: Path, save_dir: Path):
     Image.fromarray(rest).save(save_dir / f"{stem}_rest.png")
     Image.fromarray(closed).save(save_dir / f"{stem}_blink.png")
 
+    uv = check_lid_uvs(lids, len(vertices))
+    if uv is not None:
+        print(f"    lid UV stretch: p99 {uv['lid_p99']:.1f} vs body {uv['body_p99']:.1f} "
+              f"(x{uv['ratio']:.1f}); {100 * uv['torn']:.1f}% of lid edges torn across the atlas")
+
     print(f"    eye pixels at rest: {int(rest_eye.sum())}")
     print(f"    still showing at full blink: {int(still.sum())} "
           f"({100 * coverage:.1f}%), raggedness {ragged:.1f}")
@@ -198,6 +261,10 @@ def run(path: Path, save_dir: Path):
                         f"(limit {100 * COVERAGE_LIMIT:.0f}%)")
     if ragged > RAGGED_LIMIT:
         failures.append(f"remaining silhouette raggedness {ragged:.1f} > {RAGGED_LIMIT}")
+    if uv is not None and uv["ratio"] > UV_STRETCH_LIMIT:
+        failures.append(f"lid UVs stretch x{uv['ratio']:.1f} of the body's p99 "
+                        f"(limit x{UV_STRETCH_LIMIT}) -- the lid will sample the atlas "
+                        f"outside the skin and render as a smear")
     for reason in failures:
         print(f"    FAIL: {reason}")
     return not failures
