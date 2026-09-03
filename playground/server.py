@@ -45,6 +45,10 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/examples", StaticFiles(directory=str(ROOT_DIR / "examples")), name="examples")
 
+PAINTING_DIST_DIR = ROOT_DIR / "3DPainting" / "dist"
+if PAINTING_DIST_DIR.exists():
+    app.mount("/3dpainting", StaticFiles(directory=str(PAINTING_DIST_DIR), html=True), name="3dpainting")
+
 database.init_db()
 pipeline_runner = UniRigPipeline(root_dir=str(ROOT_DIR))
 statue_runner = Statue3DPipeline(root_dir=str(ROOT_DIR))
@@ -937,6 +941,17 @@ async def serve_statue_studio():
         raise HTTPException(status_code=404, detail="Statue studio page not found")
     return HTMLResponse(
         content=statue_file.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"}
+    )
+
+
+@app.api_route("/painting", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def serve_3dpainting_app():
+    index_file = ROOT_DIR / "3DPainting" / "dist" / "index.html"
+    if not index_file.exists():
+        raise HTTPException(status_code=404, detail="3DPainting app not built")
+    return HTMLResponse(
+        content=index_file.read_text(encoding="utf-8"),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"}
     )
 

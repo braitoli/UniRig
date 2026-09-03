@@ -698,6 +698,31 @@ body {
 .hint-card h3 { font-size: 16px; margin-bottom: 6px; }
 .hint-card p { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
 
+.part-hover-tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(15, 23, 42, 0.92);
+    backdrop-filter: blur(8px);
+    color: #f8fafc;
+    padding: 6px 12px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), 0 0 10px rgba(56, 189, 248, 0.2);
+    font-size: 0.78rem;
+    font-weight: 600;
+    z-index: 30;
+    white-space: nowrap;
+    transform: translate(-50%, -130%);
+    transition: opacity 0.15s ease;
+}
+
+.part-item.active-hover {
+    background-color: rgba(56, 189, 248, 0.15) !important;
+    border-color: #38bdf8 !important;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
+    transform: translateX(4px);
+}
+
 /* Interactive Painting Toolbar */
 .painting-bar {
     background-color: rgba(19, 23, 34, 0.95);

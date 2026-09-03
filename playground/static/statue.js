@@ -221,6 +221,7 @@ function initThreeJS() {
 
     renderer.domElement.addEventListener('pointerdown', onCanvasPointerDown);
     renderer.domElement.addEventListener('pointermove', onCanvasPointerMove);
+    renderer.domElement.addEventListener('pointerleave', clearHoverHighlight);
     window.addEventListener('pointerup', onCanvasPointerUp);
     window.addEventListener('pointercancel', onCanvasPointerUp);
 
@@ -310,14 +311,73 @@ function onCanvasPointerDown(event) {
     }
 }
 
-function onCanvasPointerMove(event) {
-    if (!currentModel || !isPointerDraggingPaint) return;
-    if (state.paintTool !== 'brush' && state.paintTool !== 'eraser') return;
+let hoveredMesh = null;
+let originalHoverEmissive = null;
 
-    const hitMesh = getIntersectedMesh(event);
-    if (hitMesh) {
-        applyPaintAction(hitMesh);
+function onCanvasPointerMove(event) {
+    if (!currentModel) return;
+    if (isPointerDraggingPaint && (state.paintTool === 'brush' || state.paintTool === 'eraser')) {
+        const hitMesh = getIntersectedMesh(event);
+        if (hitMesh) {
+            applyPaintAction(hitMesh);
+        }
+    } else {
+        onCanvasPointerHover(event);
     }
+}
+
+function onCanvasPointerHover(event) {
+    if (!currentModel || !renderer) return;
+    const hitMesh = getIntersectedMesh(event);
+    const tooltip = document.getElementById('part-hover-tooltip');
+
+    if (hitMesh && hitMesh !== hoveredMesh) {
+        clearHoverHighlight();
+
+        hoveredMesh = hitMesh;
+        if (hoveredMesh.material) {
+            originalHoverEmissive = hoveredMesh.material.emissive ? hoveredMesh.material.emissive.clone() : new THREE.Color(0x000000);
+            hoveredMesh.material.emissive = new THREE.Color(0x38bdf8);
+            hoveredMesh.material.emissiveIntensity = 0.4;
+        }
+
+        if (tooltip) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            tooltip.style.display = 'block';
+            tooltip.style.left = `${event.clientX - rect.left}px`;
+            tooltip.style.top = `${event.clientY - rect.top}px`;
+            const partName = hoveredMesh.name || 'Phân vùng chi tiết';
+            const faceCount = hoveredMesh.geometry?.index ? hoveredMesh.geometry.index.count / 3 : (hoveredMesh.geometry?.attributes?.position?.count / 3 || 0);
+            tooltip.innerHTML = `🎯 <strong>${partName}</strong> <span style="opacity:0.75;">(${Math.round(faceCount).toLocaleString()} mặt)</span>`;
+        }
+
+        highlightSidebarPart(hoveredMesh.name);
+    } else if (!hitMesh && hoveredMesh) {
+        clearHoverHighlight();
+    } else if (hitMesh && tooltip) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        tooltip.style.left = `${event.clientX - rect.left}px`;
+        tooltip.style.top = `${event.clientY - rect.top}px`;
+    }
+}
+
+function clearHoverHighlight() {
+    if (hoveredMesh && hoveredMesh.material && originalHoverEmissive) {
+        hoveredMesh.material.emissive.copy(originalHoverEmissive);
+        hoveredMesh.material.emissiveIntensity = 0.0;
+    }
+    hoveredMesh = null;
+    originalHoverEmissive = null;
+    const tooltip = document.getElementById('part-hover-tooltip');
+    if (tooltip) tooltip.style.display = 'none';
+    document.querySelectorAll('.part-item').forEach(i => i.classList.remove('active-hover'));
+}
+
+function highlightSidebarPart(name) {
+    document.querySelectorAll('.part-item').forEach(item => {
+        const isMatch = name && item.innerText.includes(name);
+        item.classList.toggle('active-hover', isMatch);
+    });
 }
 
 function onCanvasPointerUp() {
@@ -414,12 +474,14 @@ function applyCurrentFinishToPaintedModel() {
     });
 }
 
-/* ===================================================
-   4. Model Loading & View Modes
-   =================================================== */
-function load3DStatueModel(glbUrl, mode = 'painted') {
+function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
     showCanvasLoader('Đang tải tượng 3D...');
     state.currentGlbUrl = glbUrl;
+    if (statueName) state.currentStatueName = statueName;
+    else if (state.currentPresetKey && SAMPLE_PRESETS[state.currentPresetKey]) {
+        state.currentStatueName = SAMPLE_PRESETS[state.currentPresetKey].name;
+    }
+    syncModelTo3DPaintingIframe();
 
     const loader = new THREE.GLTFLoader();
     loader.load(glbUrl, (gltf) => {
@@ -690,7 +752,7 @@ function initUIEvents() {
 
             // 3. If preset has ready-made 3D statue model, load into Three.js immediately!
             if (preset.model) {
-                load3DStatueModel(preset.model, 'painted');
+                load3DStatueModel(preset.model, 'painted', preset.name);
 
                 // Update Stats Panel
                 document.getElementById('stat-vertices').innerText = (preset.vertices || 0).toLocaleString();
@@ -786,6 +848,19 @@ function initUIEvents() {
         playAnimation(parseInt(e.target.value));
     });
 
+    // 3DPainting Studio Engine Switcher
+    document.getElementById('btn-engine-preview').addEventListener('click', () => {
+        setStudioEngine('preview');
+    });
+    document.getElementById('btn-engine-3dpainting').addEventListener('click', () => {
+        setStudioEngine('3dpainting');
+    });
+    document.getElementById('btn-open-3dpainting-tab').addEventListener('click', () => {
+        const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
+        const name = state.currentStatueName || 'Tượng 3D';
+        window.open(`/painting?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}`, '_blank');
+    });
+
     // Automation Modal
     document.getElementById('btn-open-auto-modal').addEventListener('click', () => {
         openAutomationModal();
@@ -797,6 +872,50 @@ function initUIEvents() {
     document.getElementById('btn-scan-now').addEventListener('click', triggerManualScan);
     document.getElementById('btn-test-webhook').addEventListener('click', testWebhookPing);
     document.getElementById('btn-refresh-history').addEventListener('click', loadStatueHistory);
+}
+
+function setStudioEngine(engine) {
+    state.activeEngine = engine;
+    const is3D = engine === '3dpainting';
+    document.getElementById('btn-engine-preview').classList.toggle('active', !is3D);
+    document.getElementById('btn-engine-3dpainting').classList.toggle('active', is3D);
+
+    const canvasContainer = document.getElementById('canvas-container');
+    const iframeContainer = document.getElementById('iframe-3dpainting-container');
+    const paintingBar = document.getElementById('painting-bar');
+    const viewModes = document.getElementById('view-modes-container');
+    const viewLabel = document.getElementById('view-mode-label');
+
+    if (is3D) {
+        canvasContainer.style.display = 'none';
+        paintingBar.style.display = 'none';
+        iframeContainer.style.display = 'flex';
+        viewModes.style.display = 'none';
+        if (viewLabel) viewLabel.style.display = 'none';
+        syncModelTo3DPaintingIframe();
+    } else {
+        canvasContainer.style.display = 'block';
+        paintingBar.style.display = 'flex';
+        iframeContainer.style.display = 'none';
+        viewModes.style.display = 'flex';
+        if (viewLabel) viewLabel.style.display = 'inline-flex';
+    }
+}
+
+function syncModelTo3DPaintingIframe() {
+    const iframe = document.getElementById('iframe-3dpainting');
+    if (!iframe) return;
+    const url = state.currentGlbUrl || '/static/sample_presets/models/cyber_turtle/statue_segmented.glb';
+    const name = state.currentStatueName || 'Tượng 3D';
+
+    const targetSrc = `/3dpainting/index.html?model=${encodeURIComponent(url)}&name=${encodeURIComponent(name)}`;
+    if (!iframe.src || !iframe.src.includes(encodeURIComponent(url))) {
+        iframe.src = targetSrc;
+    } else {
+        try {
+            iframe.contentWindow?.postMessage({ type: 'LOAD_3D_MODEL', url, name }, '*');
+        } catch (e) {}
+    }
 }
 
 function setPaintTool(tool) {

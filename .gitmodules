@@ -1,0 +1,3 @@
+[submodule "3DPainting"]
+	path = 3DPainting
+	url = https://github.com/braitoli/3DPainting

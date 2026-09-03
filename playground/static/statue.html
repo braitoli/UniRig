@@ -194,8 +194,12 @@
             <section class="panel panel-center">
                 <div class="viewport-toolbar">
                     <div class="toolbar-group">
-                        <span class="toolbar-title"><i class="fa-solid fa-eye"></i> Chế độ xem:</span>
-                        <div class="view-modes">
+                        <div class="segmented-control" id="studio-engine-control" style="margin-right: 8px;">
+                            <button type="button" class="segment-btn active" id="btn-engine-preview" title="Trình xem & tô nhanh WebGL"><i class="fa-solid fa-cube"></i> Xem 3D</button>
+                            <button type="button" class="segment-btn" id="btn-engine-3dpainting" title="Xưởng Tô Tượng Chuyên Nghiệp (3DPainting App)"><i class="fa-solid fa-palette"></i> Studio 3DPainting</button>
+                        </div>
+                        <span class="toolbar-title" id="view-mode-label"><i class="fa-solid fa-eye"></i> Chế độ xem:</span>
+                        <div class="view-modes" id="view-modes-container">
                             <button class="mode-btn active" data-mode="painted" title="Tô màu thử nghiệm trực tiếp"><i class="fa-solid fa-palette"></i> Đang Tô Màu</button>
                             <button class="mode-btn" data-mode="plaster" title="Tượng thạch cao trắng nguyên bản"><i class="fa-solid fa-monument"></i> Thạch Cao Trắng</button>
                             <button class="mode-btn" data-mode="segmented" title="Xem các phân vùng bộ phận để đổ màu"><i class="fa-solid fa-puzzle-piece"></i> Phân Vùng Đổ Màu</button>
@@ -205,6 +209,7 @@
                     </div>
 
                     <div class="toolbar-group">
+                        <button class="btn-icon" id="btn-open-3dpainting-tab" title="Mở Studio 3DPainting toàn màn hình tab mới"><i class="fa-solid fa-arrow-up-right-from-square"></i></button>
                         <button class="btn-icon" id="btn-reset-camera" title="Căn giữa góc nhìn"><i class="fa-solid fa-compress"></i></button>
                         <button class="btn-icon" id="btn-toggle-grid" title="Bật/tắt mặt sàn"><i class="fa-solid fa-table-cells"></i></button>
                         <button class="btn-icon" id="btn-screenshot" title="Chụp ảnh kết quả"><i class="fa-solid fa-camera"></i></button>
@@ -217,6 +222,7 @@
                         <div class="spinner"></div>
                         <span id="canvas-loader-text">Đang tải mô hình 3D...</span>
                     </div>
+                    <div class="part-hover-tooltip" id="part-hover-tooltip" style="display:none;"></div>
                     <div class="empty-viewport-hint" id="empty-viewport-hint">
                         <div class="hint-card">
                             <i class="fa-solid fa-shapes hint-icon"></i>
@@ -224,6 +230,11 @@
                             <p>Tải ảnh 2D ở cột bên trái hoặc chọn ảnh mẫu để bắt đầu tạo tượng và tô màu thử nghiệm.</p>
                         </div>
                     </div>
+                </div>
+
+                <!-- Embedded 3DPainting Studio Engine -->
+                <div class="iframe-3dpainting-container" id="iframe-3dpainting-container" style="display:none; flex:1; width:100%; height:100%; position:relative; min-height:480px;">
+                    <iframe id="iframe-3dpainting" src="/3dpainting/index.html" style="width:100%; height:100%; border:none;" allow="accelerometer; camera; gyroscope"></iframe>
                 </div>
 
                 <!-- Interactive Painting Studio Bar -->
