@@ -255,6 +255,31 @@ def segment_statue_parts(
     unassigned = (face_part_ids == 0) & (~top_mask)
     face_part_ids[unassigned] = 2
 
+    # Topological smoothing of part labels (FaceParsing mesh_segmenter approach)
+    if hasattr(mesh, "face_adjacency") and len(mesh.face_adjacency) > 0:
+        try:
+            import scipy.sparse as sp
+            adj = mesh.face_adjacency
+            num_f = len(face_part_ids)
+            a, b = adj[:, 0], adj[:, 1]
+            self_idx = np.arange(num_f)
+            rows = np.concatenate([a, b, self_idx])
+            cols = np.concatenate([b, a, self_idx])
+            data = np.ones(len(rows), dtype=np.float32)
+            adj_mat = sp.csr_matrix((data, (rows, cols)), shape=(num_f, num_f))
+            num_classes = int(face_part_ids.max()) + 1
+            cur_labels = face_part_ids.copy()
+            for _ in range(5):
+                one_hot = sp.csr_matrix(
+                    (np.ones(num_f, dtype=np.float32), (self_idx, cur_labels)),
+                    shape=(num_f, num_classes)
+                )
+                neighborhood_votes = adj_mat @ one_hot
+                cur_labels = np.asarray(neighborhood_votes.argmax(axis=1)).ravel()
+            face_part_ids = cur_labels
+        except Exception as e:
+            print(f"[StatueOptimizer] Topology label smoothing notice: {e}")
+
     unique_ids = sorted(np.unique(face_part_ids).tolist())
     submeshes: Dict[str, trimesh.Trimesh] = {}
     part_info = []

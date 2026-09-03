@@ -18,8 +18,10 @@ from scipy.sparse.csgraph import connected_components
 import trimesh
 
 _WELD_TOLERANCE = 1e-5
-_BURIED_DEPTH = 4.5
-_CLUSTER_FLOOR = 100
+_VIEWS = 26
+_RESOLUTION = 512
+_BURIED_DEPTH = 5.0
+_CLUSTER_FLOOR = 120
 _PATCH_MAX_RIM = 256
 _PATCH_ROUNDS = 6
 _MAX_REMOVED_SHARE = 0.5
@@ -274,17 +276,65 @@ def _fill_new_holes(
     return np.asarray(patch, np.int64) if patch else np.empty((0, 3), np.int64)
 
 
+def clean_floating_debris(
+    mesh: trimesh.Trimesh,
+    min_faces: int = 30
+) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Detects and eliminates small floating fragments / speck artifacts produced by
+    Marching Cubes / FlexiCubes that are disconnected from the primary mesh body.
+    Preserves all UVs, vertex colors, and materials.
+    """
+    if len(mesh.faces) == 0:
+        return mesh, 0
+
+    vertices = np.asarray(mesh.vertices, np.float64)
+    faces = np.asarray(mesh.faces, np.int64)
+    span = float(np.ptp(vertices, axis=0).max()) or 1.0
+    welded = _welded(vertices, span)
+    wf = welded[faces]
+
+    rows = np.repeat(np.arange(len(faces)), 3)
+    incidence = sparse.csr_matrix(
+        (np.ones(wf.size), (rows, wf.ravel())),
+        shape=(len(faces), int(wf.max()) + 1),
+    )
+    n_comp, labels = connected_components(incidence @ incidence.T, directed=False)
+    counts = np.bincount(labels)
+
+    keep_components = np.where(counts >= min_faces)[0]
+    if len(keep_components) == 0:
+        keep_components = [np.argmax(counts)]
+
+    keep_faces = np.isin(labels, keep_components)
+    removed_count = int((~keep_faces).sum())
+    if removed_count == 0:
+        return mesh, 0
+
+    cleaned = mesh.copy()
+    cleaned.update_faces(keep_faces)
+    cleaned.remove_unreferenced_vertices()
+    return cleaned, removed_count
+
+
 def clean_and_cull_mesh(
     mesh: trimesh.Trimesh,
     remove_hidden: bool = True,
-    views: int = 16,
-    resolution: int = 256,
+    remove_debris: bool = True,
+    views: int = _VIEWS,
+    resolution: int = _RESOLUTION,
     buried_depth: float = _BURIED_DEPTH,
     cluster_floor: int = _CLUSTER_FLOOR,
 ) -> Tuple[trimesh.Trimesh, Dict[str, Any], np.ndarray]:
     """
-    Cleans degenerate/duplicate geometry and extracts outer shell by culling buried interior faces.
-    Preserves texture UV coordinates, vertex colors, and materials.
+    Comprehensive geometry sanitation & exterior shell extraction:
+    1. Removes degenerate zero-area triangles.
+    2. Removes duplicate / back-to-back inverted triangles (preserving decal & UV layers).
+    3. Multi-view Z-buffered spherical clearance probing (26 Fibonacci views at 512x512).
+    4. Silhouette rim protection and contiguous cluster thresholding.
+    5. Watertight boundary hole patching preserving UVs.
+    6. Floating debris artifact elimination.
+    7. Consistent outward normal orientation.
     """
     started = time.perf_counter()
     vertices = np.asarray(mesh.vertices, np.float64)
@@ -302,12 +352,12 @@ def clean_and_cull_mesh(
     degenerate = twice_area <= (span ** 2) * 1e-14
     keep &= ~degenerate
 
-    # 2. Duplicate coincident triangles (UV & vertex color aware)
+    # 2. Duplicate coincident & back-to-back inverted triangles (UV & vertex color aware)
     identity = _welded(vertices, span)[:, None]
     for attribute in (getattr(mesh.visual, "uv", None),
                       getattr(mesh.visual, "vertex_colors", None)):
         if attribute is not None and len(attribute) == len(vertices):
-            fine = np.round(np.asarray(attribute, np.float64) * 1e5).astype(np.int64)
+            fine = np.round(np.asarray(attribute, np.float64) * 1e6).astype(np.int64)
             identity = np.concatenate([identity, fine], axis=1)
     identity = np.unique(identity, axis=0, return_inverse=True)[1]
 
@@ -317,7 +367,7 @@ def clean_and_cull_mesh(
     repeated[first] = False
     keep &= ~repeated
 
-    # 3. Unseen interior / buried geometry removal
+    # 3. Unseen interior / buried geometry removal (26 spherical views, 512 resolution)
     hidden = np.zeros(len(faces), bool)
     checked = 0
     if remove_hidden and keep.any():
@@ -361,6 +411,7 @@ def clean_and_cull_mesh(
         "hidden": int((hidden & gone).sum()),
         "kept_back": int((hidden & keep).sum()),
         "checked": checked,
+        "debris_removed": 0,
         "applied": True,
     }
 
@@ -387,6 +438,15 @@ def clean_and_cull_mesh(
     survived = np.zeros(before_vertices, bool)
     survived[np.asarray(cleaned.faces).ravel()] = True
     cleaned.update_vertices(survived)
+
+    # 5. Remove disconnected floating debris specks
+    if remove_debris:
+        cleaned, debris_removed = clean_floating_debris(cleaned, min_faces=30)
+        report["debris_removed"] = debris_removed
+
+    # 6. Ensure normals and winding are consistent
+    trimesh.repair.fix_normals(cleaned)
+    trimesh.repair.fix_winding(cleaned)
 
     report.update(
         faces_after=int(len(cleaned.faces)),
