@@ -12,13 +12,14 @@ import numpy as np
 # Essential GPU Environment Settings
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ['ATTN_BACKEND'] = 'flash_attn'
+os.environ['ATTN_BACKEND'] = os.environ.get('ATTN_BACKEND', 'sdpa')
+os.environ['SPARSE_ATTN_BACKEND'] = os.environ.get('SPARSE_ATTN_BACKEND', 'xformers')
 os.environ['PATH'] = f"/home/braitoli/miniconda/envs/trellis/bin:{os.environ.get('PATH', '')}"
 
 # Add trellis2 repository to sys.path
-TRELLIS_ROOT = Path('/home/braitoli/workspace/namnh/code/poc/trellis2')
-if TRELLIS_ROOT.exists() and str(TRELLIS_ROOT) not in sys.path:
-    sys.path.insert(0, str(TRELLIS_ROOT))
+for _candidate in ['/workspace/trellis2', '/home/braitoli/workspace/namnh/code/poc/trellis2', '/opt/trellis2']:
+    if Path(_candidate).exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
 
 import torch
 # PyTorch TensorFloat-32 & Fast CUDA Acceleration
@@ -216,7 +217,7 @@ async def generate_3d(req: GenerateRequest):
         attr_layout         =   pipeline.pbr_attr_layout if hasattr(pipeline, 'pbr_attr_layout') else mesh.layout,
         voxel_size          =   mesh.voxel_size,
         aabb                =   [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target   =   req.decimation_target,
+        decimation_target   =   req.decimation_target if (req.decimation_target and req.decimation_target > 0) else 500000,
         texture_size        =   req.texture_size,
         remesh              =   True,
         remesh_band         =   1,

@@ -11,10 +11,16 @@ from PIL import Image
 # Essential environment settings
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ.setdefault('ATTN_BACKEND', 'flash_attn')
+os.environ['ATTN_BACKEND'] = os.environ.get('ATTN_BACKEND', 'sdpa')
+os.environ['SPARSE_ATTN_BACKEND'] = os.environ.get('SPARSE_ATTN_BACKEND', 'xformers')
 os.environ['PATH'] = f"/home/braitoli/miniconda/envs/trellis/bin:{os.environ.get('PATH', '')}"
 
 PIXAL3D_ROOT = '/home/braitoli/workspace/namnh/code/poc/Pixal3D'
+for _candidate in ['/workspace/Pixal3D', str(Path(__file__).resolve().parent.parent.parent / 'Pixal3D'), '/opt/Pixal3D']:
+    if os.path.exists(_candidate):
+        PIXAL3D_ROOT = _candidate
+        break
+
 if PIXAL3D_ROOT not in sys.path:
     sys.path.insert(0, PIXAL3D_ROOT)
 

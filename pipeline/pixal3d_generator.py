@@ -186,19 +186,18 @@ def _drop_model_page_cache() -> float:
     return _mem_free_gb() - before
 
 
-def _plan_memory(requested_low_vram: bool, report=None) -> bool:
+def _plan_memory(requested_low_vram: bool) -> bool:
     """Make room for the load and decide which mode it can afford.
 
     Returns the low-VRAM flag actually to use, which may be True even when the caller
     asked for standard mode.
 
-    There are only two levers here, and both get pulled before the mode is chosen: the
-    cached model pages, and the warm TRELLIS worker. Everything else is out of reach --
-    the 25 GB TRELLIS service on port 7870 belongs to another project and swap is
-    already full. The worker goes whenever the standard threshold is not met rather than
-    only when low-VRAM also fails to fit, because a run that kept the cache warm and then
-    OOMed halfway through sampling -- observed, at image_conditioned_proj.py:523 -- traded
-    the user's job for a cache.
+    Only one lever gets pulled before the mode is chosen: the cached model pages.
+    Stopping another generator's resident TRELLIS worker to make room is no longer done
+    here -- one generator taking memory from another is exactly the silent cross-project
+    contention this host has been burned by (see CLAUDE.md, "nhiều dự án cùng chạm 1
+    GPU"). If dropping the page cache isn't enough, low-VRAM mode (or, failing that, a
+    real OOM) is the honest outcome instead.
     """
     free = _mem_free_gb()
 
@@ -208,16 +207,6 @@ def _plan_memory(requested_low_vram: bool, report=None) -> bool:
             free = _mem_free_gb()
             print(f"[Pixal3D] Dropped the cached model pages: {recovered:.1f} GB back, "
                   f"now {free:.1f} GB free.")
-
-    if free < PIXAL3D_STANDARD_FREE_GB and _trellis_worker_pids():
-        if report:
-            # Same percentage as the caller's last report: this is a pause inside that
-            # step, and a bar that walks backwards reads as a restart.
-            report(25, "Đang giải phóng bộ nhớ GPU (tạm dừng worker TRELLIS)...", 2, 5)
-        freed = stop_trellis_worker()
-        free = _mem_free_gb()
-        print(f"[Pixal3D] Stopped the persistent TRELLIS worker for headroom: it gave "
-              f"back {freed:.1f} GB, now {free:.1f} GB free.")
 
     if requested_low_vram or free < PIXAL3D_STANDARD_FREE_GB:
         if not requested_low_vram:
@@ -257,7 +246,11 @@ class Pixal3DImageTo3DGenerator:
     ):
         self.model_id = model_id
         self.device = device
-        self.trellis_python = "/home/braitoli/miniconda/envs/trellis/bin/python"
+        self.trellis_python = sys.executable
+        for _candidate in ["/venv/main/bin/python", "/home/braitoli/miniconda/envs/trellis/bin/python"]:
+            if Path(_candidate).exists():
+                self.trellis_python = _candidate
+                break
         self.infer_script = Path(__file__).resolve().parent / "pixal3d_infer.py"
         self.mv_infer_script = Path(__file__).resolve().parent / "pixal3d_mv_infer.py"
 
@@ -329,7 +322,7 @@ class Pixal3DImageTo3DGenerator:
                 f"script={self.infer_script}"
             )
 
-        low_vram = _plan_memory(low_vram, report)
+        low_vram = _plan_memory(low_vram)
 
         def build_cmd(use_low_vram: bool):
             cmd = [
@@ -356,7 +349,8 @@ class Pixal3DImageTo3DGenerator:
         env["PATH"] = f"/home/braitoli/miniconda/envs/trellis/bin:{env.get('PATH', '')}"
         env["OPENCV_IO_ENABLE_OPENEXR"] = "1"
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-        env["ATTN_BACKEND"] = "flash_attn"
+        env["ATTN_BACKEND"] = os.environ.get("ATTN_BACKEND", "sdpa")
+        env["SPARSE_ATTN_BACKEND"] = os.environ.get("SPARSE_ATTN_BACKEND", "xformers")
 
         # Measured on a GB10 at 1536 / 12 steps per stage / 1M-face decimation / 4096
         # bake: 403.9s standard and 400.2s low-VRAM, so one estimate covers both modes.
@@ -470,7 +464,7 @@ class Pixal3DImageTo3DGenerator:
                 f"script={self.mv_infer_script}"
             )
 
-        low_vram = _plan_memory(low_vram, report)
+        low_vram = _plan_memory(low_vram)
 
         def build_cmd(use_low_vram: bool):
             cmd = [
@@ -496,7 +490,8 @@ class Pixal3DImageTo3DGenerator:
         env["PATH"] = f"/home/braitoli/miniconda/envs/trellis/bin:{env.get('PATH', '')}"
         env["OPENCV_IO_ENABLE_OPENEXR"] = "1"
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-        env["ATTN_BACKEND"] = "flash_attn"
+        env["ATTN_BACKEND"] = os.environ.get("ATTN_BACKEND", "sdpa")
+        env["SPARSE_ATTN_BACKEND"] = os.environ.get("SPARSE_ATTN_BACKEND", "xformers")
 
         # Measured on a GB10: 457s for the 1536 cascade at 12 steps/stage with a 1M-face
         # decimation and a 4096 bake. A 50s estimate here pinned the bar at 80% for most

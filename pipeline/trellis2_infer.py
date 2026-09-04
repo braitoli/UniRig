@@ -9,11 +9,19 @@ import numpy as np
 # Essential environment settings
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ['ATTN_BACKEND'] = 'flash_attn'
+os.environ['ATTN_BACKEND'] = os.environ.get('ATTN_BACKEND', 'flash_attn')
+try:
+    import xformers
+    _default_sparse_backend = 'xformers'
+except ImportError:
+    _default_sparse_backend = 'sdpa'
+os.environ['SPARSE_ATTN_BACKEND'] = os.environ.get('SPARSE_ATTN_BACKEND', _default_sparse_backend)
 os.environ['PATH'] = f"/home/braitoli/miniconda/envs/trellis/bin:{os.environ.get('PATH', '')}"
 
 # Add trellis2 repository to sys.path
-sys.path.insert(0, '/home/braitoli/workspace/namnh/code/poc/trellis2')
+for _p in ['/workspace/trellis2', str(Path(__file__).resolve().parent.parent.parent / 'trellis2'), '/home/braitoli/workspace/namnh/code/poc/trellis2', '/opt/trellis2']:
+    if os.path.exists(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 def preprocess_image_for_trellis(input_img: Image.Image) -> Image.Image:
     """Preprocess input image to centered foreground RGBA with bounding box crop."""
@@ -143,7 +151,7 @@ def main():
         attr_layout         =   pipeline.pbr_attr_layout if hasattr(pipeline, 'pbr_attr_layout') else mesh.layout,
         voxel_size          =   mesh.voxel_size,
         aabb                =   [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target   =   args.decimation_target,
+        decimation_target   =   args.decimation_target if (args.decimation_target and args.decimation_target > 0) else 500000,
         texture_size        =   args.texture_size,
         remesh              =   True,
         remesh_band         =   1,

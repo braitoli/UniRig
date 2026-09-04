@@ -115,7 +115,7 @@ class TrellisImageTo3DGenerator:
         Converts 2D image into 3D GLB mesh using TRELLIS.2-4B.
         """
         t0 = time.time()
-        output_path = Path(output_glb_path)
+        output_path = Path(output_glb_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         def report(pct: int, msg: str, step_idx: int = 1, total_steps: int = 5):
@@ -131,12 +131,16 @@ class TrellisImageTo3DGenerator:
         if isinstance(image_input, Image.Image):
             temp_img_path = output_path.parent / "temp_input_image.png"
             image_input.save(str(temp_img_path))
-            input_file_str = str(temp_img_path)
+            input_file_str = str(temp_img_path.resolve())
         else:
-            input_file_str = str(image_input)
+            input_file_str = str(Path(image_input).resolve())
 
         mesh_generated = False
-        trellis_python = "/home/braitoli/miniconda/envs/trellis/bin/python"
+        trellis_python = sys.executable
+        for _candidate in ["/venv/main/bin/python", "/home/braitoli/miniconda/envs/trellis/bin/python"]:
+            if Path(_candidate).exists():
+                trellis_python = _candidate
+                break
         infer_script = Path(__file__).parent / "trellis2_infer.py"
 
         # Step 2: Initialize TRELLIS.2-4B
@@ -144,6 +148,10 @@ class TrellisImageTo3DGenerator:
 
         # Check if Persistent GPU Worker is active on port 7865
         worker_port = int(os.environ.get("TRELLIS_PORT", "7865"))
+        # STATUE_RESIDENT_GENERATOR=trellis means the caller expects the resident worker
+        # to exist. If it doesn't answer, that's a real failure to surface, not a cue to
+        # silently spin up a second 4B model in the same memory pool.
+        resident_mode = os.environ.get("STATUE_RESIDENT_GENERATOR", "").strip().lower() == "trellis"
         is_worker_online = False
         try:
             import requests
@@ -215,6 +223,14 @@ class TrellisImageTo3DGenerator:
             except Exception as e_w:
                 print(f"[TrellisGenerator] Error calling GPU worker: {e_w}")
 
+        if not mesh_generated and resident_mode:
+            raise RuntimeError(
+                f"Chế độ resident TRELLIS đang bật (STATUE_RESIDENT_GENERATOR=trellis) nhưng "
+                f"worker cổng {worker_port} không sẵn sàng. Không tự động tải thêm một bản "
+                f"TRELLIS.2-4B dự phòng để tránh hai bản model cùng tồn tại trong bộ nhớ — "
+                f"thử lại sau khi worker online, hoặc tắt STATUE_RESIDENT_GENERATOR."
+            )
+
         if not mesh_generated and Path(trellis_python).exists() and infer_script.exists():
             try:
                 print(f"[TrellisGenerator] Invoking TRELLIS.2-4B neural engine via subprocess on {input_file_str}...")
@@ -240,6 +256,13 @@ class TrellisImageTo3DGenerator:
                 env["PATH"] = f"/home/braitoli/miniconda/envs/trellis/bin:{env.get('PATH', '')}"
                 env["OPENCV_IO_ENABLE_OPENEXR"] = "1"
                 env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+                env["ATTN_BACKEND"] = os.environ.get("ATTN_BACKEND", "sdpa")
+                try:
+                    import xformers
+                    _default_sparse = "xformers"
+                except ImportError:
+                    _default_sparse = "sdpa"
+                env["SPARSE_ATTN_BACKEND"] = os.environ.get("SPARSE_ATTN_BACKEND", _default_sparse)
 
                 proc_state = {"done": False, "res": None}
 
@@ -272,16 +295,15 @@ class TrellisImageTo3DGenerator:
             except Exception as e:
                 print(f"[TrellisGenerator] Error executing TRELLIS.2 subprocess: {e}")
 
-        # Fallback mesh generator if model pipeline unavailable or failed
+        # Không dùng mesh dựng hình học giả (SDF từ silhouette 2D) thay thế nữa: cả worker
+        # resident lẫn subprocess tự tải đều thất bại nghĩa là TRELLIS thật sự không sinh
+        # được mesh — báo lỗi rõ ràng để người dùng biết job thất bại, thay vì âm thầm trả
+        # về một kết quả không phải TRELLIS mà trông giống thành công.
         if not mesh_generated or not output_path.exists():
-            report(45, "Tái tạo hình học 3D bề mặt đa tầng & phân tích thể tích SDF...", 3, 5)
-            print("[TrellisGenerator] Running fallback 3D character mesh reconstruction...")
-            raw_img = Image.open(input_file_str).convert("RGBA")
-            mesh = self._create_fallback_character_mesh(raw_img)
-            report(75, "Trích xuất UV Vertex Color & làm mịn bề mặt Laplacian...", 4, 5)
-            mesh.export(str(output_path))
-
-
+            raise RuntimeError(
+                "TRELLIS.2-4B không sinh được mesh (worker resident và subprocess tự tải đều "
+                "thất bại)."
+            )
 
         # Step 5: Inspect created mesh statistics & auto-orient to upright Y-Up
         report(95, "Căn chỉnh hệ toạ độ Y-Up & chiếu xạ kết cấu màu sắc (UV/Texture)...", 5, 5)
@@ -355,71 +377,4 @@ class TrellisImageTo3DGenerator:
             mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, vertex_colors=colors)
         except Exception as e:
             print(f"[TrellisGenerator] Texture projection note: {e}")
-        return mesh
-
-
-
-    def _create_fallback_character_mesh(self, img: Image.Image) -> trimesh.Trimesh:
-        """
-        Reconstructs an accurate, watertight, manifold 3D mesh from the input 2D image
-        by extracting its exact alpha silhouette / foreground contour, computing distance transform (SDF),
-        and projecting RGB pixel colors onto the 3D surface.
-        """
-        from scipy.ndimage import distance_transform_edt, gaussian_filter
-        from skimage import measure
-
-        w, h = img.size
-        res = 128
-        img_small = img.resize((res, res), Image.Resampling.LANCZOS)
-        arr = np.array(img_small)
-        rgb = arr[:, :, :3]
-        alpha = arr[:, :, 3]
-
-        if (alpha < 250).sum() > 100:
-            mask = (alpha > 30).astype(np.float32)
-        else:
-            # Estimate background color from corners
-            bg = rgb[0, 0].astype(np.float32)
-            diff = np.linalg.norm(rgb.astype(np.float32) - bg, axis=-1)
-            mask = (diff > 25).astype(np.float32)
-
-        mask = gaussian_filter(mask, sigma=0.8) > 0.5
-        dist = distance_transform_edt(mask)
-        max_d = dist.max()
-        if max_d > 0:
-            dist = dist / max_d
-
-        z_res = 64
-        volume = np.zeros((res, res, z_res), dtype=np.float32)
-        z_coords = np.linspace(-1, 1, z_res)
-
-        for z_idx, z in enumerate(z_coords):
-            thickness = np.maximum(dist ** 0.55 * 0.7, 0.05)
-            inside = (np.abs(z) <= thickness) & mask
-            volume[:, :, z_idx] = inside.astype(np.float32)
-
-        volume = gaussian_filter(volume, sigma=1.0)
-        verts, faces, normals, values = measure.marching_cubes(volume, level=0.5)
-
-        # Map vertex coordinates to [ -0.5, 0.5 ] image space
-        verts[:, 0] = (verts[:, 0] / res - 0.5)
-        verts[:, 1] = -(verts[:, 1] / res - 0.5)  # Flip Y for standard 3D coordinate frame
-        verts[:, 2] = (verts[:, 2] / z_res - 0.5) * 0.35
-
-        # Sample vertex colors from image
-        uv_x = np.clip(((verts[:, 0] + 0.5) * (w - 1)).astype(int), 0, w - 1)
-        uv_y = np.clip(((-verts[:, 1] + 0.5) * (h - 1)).astype(int), 0, h - 1)
-
-        orig_arr = np.array(img)
-        vertex_colors = orig_arr[uv_y, uv_x, :3]
-        vertex_colors = np.hstack([vertex_colors, np.full((len(verts), 1), 255, dtype=np.uint8)])
-
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors, process=True)
-        try:
-            trimesh.smoothing.filter_laplacian(mesh, lamb=0.3, iterations=3, volume_constraint=False)
-            if np.isnan(mesh.vertices).any():
-                mesh.vertices = verts
-        except Exception:
-            mesh.vertices = verts
-
         return mesh
