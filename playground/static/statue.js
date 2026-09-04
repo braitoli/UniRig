@@ -448,7 +448,12 @@ function updateViewMode(mode, reloadModel = false) {
 
     if (!currentModel) return;
 
-    // If returning from textured mode to segmented/plaster, reload segmented model if needed
+    // Nếu model đang nạp KHÔNG PHẢI bản segmented_glb (ví dụ đang ở textured_glb — chỉ có
+    // 1 mesh node, không có 7 phân vùng), phải nạp lại đúng bản segmented mới có phân vùng
+    // để hiện. Trước đây có thêm điều kiện `.includes('_textured.glb')` để chỉ reload khi
+    // rời từ textured — nhưng URL textured của job là `/files/textured_glb` (không có đuôi
+    // .glb) nên điều kiện đó không bao giờ khớp, làm mode segmented bị kẹt hiện textured.
+    // Bỏ điều kiện thừa đó, dùng đúng cách so sánh URL đơn giản như nhánh 'textured' đang làm.
     if ((mode === 'segmented' || mode === 'plaster') && reloadModel) {
         let segUrl = null;
         if (state.activeJobId) {
@@ -456,13 +461,17 @@ function updateViewMode(mode, reloadModel = false) {
         } else if (state.currentPresetKey && SAMPLE_PRESETS[state.currentPresetKey]) {
             segUrl = SAMPLE_PRESETS[state.currentPresetKey].model;
         }
-        if (segUrl && state.currentGlbUrl && state.currentGlbUrl.includes('_textured.glb') && state.currentGlbUrl !== segUrl) {
-            load3DStatueModel(segUrl, mode);
+        if (segUrl && state.currentGlbUrl !== segUrl) {
+            // Dự phòng: nếu segmented_glb tải lỗi, quay lại đúng model đang hiển thị hiện tại
+            // (mode textured) thay vì để khung nhìn trống/vỡ.
+            const fallbackUrl = state.currentGlbUrl;
+            load3DStatueModel(segUrl, mode, '', fallbackUrl, 'textured');
             return;
         }
     }
 
     if (mode === 'plaster') {
+        hideBoundaryLines();
         currentModel.traverse((child) => {
             if (child.isMesh) {
                 if (child.material) child.material.wireframe = false;
@@ -480,6 +489,7 @@ function updateViewMode(mode, reloadModel = false) {
                 }
             }
         });
+        ensureBoundaryLines();
     } else if (mode === 'textured') {
         if (reloadModel) {
             let texUrl = null;
@@ -506,13 +516,132 @@ function updateViewMode(mode, reloadModel = false) {
                 if (child.material) child.material.wireframe = false;
             }
         });
+        hideBoundaryLines();
     } else if (mode === 'wireframe') {
         currentModel.traverse((child) => {
             if (child.isMesh && child.material) {
                 child.material.wireframe = true;
             }
         });
+        hideBoundaryLines();
     }
+}
+
+// ===== Đường viền ranh giới các phân vùng (chỉ hiện ở mode 'segmented') =====
+// Với mỗi submesh, cạnh nào chỉ thuộc đúng 1 tam giác trong CHÍNH submesh đó là biên của
+// vùng (biên ngoài của submesh HOẶC ranh giới với submesh khác — đúng cái cần vẽ).
+let boundaryLinesForModel = null; // currentModel đã tính đường viền, dùng để cache
+let boundaryLineObjects = [];     // mỗi phần tử là 1 THREE.LineSegments, làm con của submesh tương ứng
+let boundaryLineMaterial = null;  // dùng chung 1 material cho mọi đường viền, không tạo lại mỗi lần
+
+function getBoundaryLineMaterial() {
+    if (!boundaryLineMaterial) {
+        // Màu tối, tương phản với các vật liệu phân vùng thường sáng/pastel.
+        boundaryLineMaterial = new THREE.LineBasicMaterial({ color: 0x11151f });
+    }
+    return boundaryLineMaterial;
+}
+
+function computeBoundaryEdgesForMesh(mesh) {
+    const geom = mesh.geometry;
+    const posAttr = geom.attributes.position;
+    const normAttr = geom.attributes.normal;
+    const index = geom.index ? geom.index.array : null;
+    const idxCount = index ? index.length : posAttr.count;
+
+    if (!geom.boundingSphere) geom.computeBoundingSphere();
+    // Đẩy đỉnh đường viền ra ngoài theo pháp tuyến một khoảng rất nhỏ để chống z-fighting
+    // với chính mặt tam giác — tỉ lệ theo kích thước mesh để hợp lý ở mọi model.
+    const eps = Math.max((geom.boundingSphere ? geom.boundingSphere.radius : 1) * 0.0015, 0.0002);
+
+    // key = toạ độ 2 đầu mút đã làm tròn (gộp các đỉnh trùng vị trí nhưng tách rời do UV seam)
+    const edgeMap = new Map();
+    const ROUND = 1e4;
+    const vKey = (x, y, z) => Math.round(x * ROUND) + ',' + Math.round(y * ROUND) + ',' + Math.round(z * ROUND);
+
+    function addEdge(ia, ib) {
+        const ax = posAttr.getX(ia), ay = posAttr.getY(ia), az = posAttr.getZ(ia);
+        const bx = posAttr.getX(ib), by = posAttr.getY(ib), bz = posAttr.getZ(ib);
+        const ka = vKey(ax, ay, az), kb = vKey(bx, by, bz);
+        const key = ka < kb ? ka + '|' + kb : kb + '|' + ka;
+        const existing = edgeMap.get(key);
+        if (existing) {
+            existing.count++;
+        } else {
+            edgeMap.set(key, {
+                count: 1,
+                ax, ay, az, bx, by, bz,
+                anx: normAttr ? normAttr.getX(ia) : 0, any: normAttr ? normAttr.getY(ia) : 0, anz: normAttr ? normAttr.getZ(ia) : 1,
+                bnx: normAttr ? normAttr.getX(ib) : 0, bny: normAttr ? normAttr.getY(ib) : 0, bnz: normAttr ? normAttr.getZ(ib) : 1
+            });
+        }
+    }
+
+    for (let t = 0; t < idxCount; t += 3) {
+        const i0 = index ? index[t] : t;
+        const i1 = index ? index[t + 1] : t + 1;
+        const i2 = index ? index[t + 2] : t + 2;
+        addEdge(i0, i1);
+        addEdge(i1, i2);
+        addEdge(i2, i0);
+    }
+
+    const positions = [];
+    edgeMap.forEach((e) => {
+        if (e.count === 1) {
+            positions.push(
+                e.ax + e.anx * eps, e.ay + e.any * eps, e.az + e.anz * eps,
+                e.bx + e.bnx * eps, e.by + e.bny * eps, e.bz + e.bnz * eps
+            );
+        }
+    });
+    return positions;
+}
+
+function disposeBoundaryLines() {
+    boundaryLineObjects.forEach((obj) => {
+        if (obj.parent) obj.parent.remove(obj);
+        obj.geometry.dispose();
+    });
+    boundaryLineObjects = [];
+    boundaryLinesForModel = null;
+}
+
+function ensureBoundaryLines() {
+    if (!currentModel) return;
+    // Đã tính cho đúng model này rồi — chỉ cần hiện lại, không tính lại (mesh có thể tới
+    // hàng trăm nghìn mặt, không nên tính mỗi lần bấm qua lại chế độ).
+    if (boundaryLinesForModel === currentModel) {
+        boundaryLineObjects.forEach((obj) => { obj.visible = true; });
+        return;
+    }
+    disposeBoundaryLines();
+
+    const startTime = performance.now();
+    let totalEdges = 0;
+    const material = getBoundaryLineMaterial();
+
+    currentModel.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+            const positions = computeBoundaryEdgesForMesh(child);
+            if (positions.length === 0) return;
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            const lines = new THREE.LineSegments(geom, material);
+            lines.renderOrder = 1;
+            child.add(lines);
+            boundaryLineObjects.push(lines);
+            totalEdges += positions.length / 6;
+        }
+    });
+
+    boundaryLinesForModel = currentModel;
+    const elapsedMs = performance.now() - startTime;
+    console.log(`[boundary] Đã dựng ${totalEdges} cạnh biên cho ${boundaryLineObjects.length} phân vùng trong ${elapsedMs.toFixed(1)}ms`);
+}
+
+function hideBoundaryLines() {
+    boundaryLineObjects.forEach((obj) => { obj.visible = false; });
 }
 
 function setupAnimations(gltf) {
