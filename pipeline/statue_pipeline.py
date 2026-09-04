@@ -136,7 +136,7 @@ class Statue3DPipeline:
 
         # Step 5: Intelligent Anatomical Part Segmentation
         report(75, "Đang phân tích và phân vùng giải phẫu (Đầu, Thân, Tóc, Tay, Chân) cho tính năng Đổ Màu...", 4, 5)
-        seg_data = segment_statue_parts(mesh, has_pedestal=has_pedestal)
+        seg_data = segment_statue_parts(mesh, has_pedestal=has_pedestal, texture_source=textured_mesh)
 
         # Step 6: Export Statue GLBs
         report(88, "Đang xuất bản các định dạng Tượng (Thạch cao trắng, Phân vùng, Texture, ZIP)...", 5, 5)

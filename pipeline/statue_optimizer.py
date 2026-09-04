@@ -219,18 +219,110 @@ def decimate_mesh_for_statue(
         print(f"[StatueOptimizer] Warning: Decimation failed ({e}), returning original mesh")
         return mesh
 
+# Id vùng cho ra nhãn người dùng nhìn thấy (`Vùng 1`..`Vùng 7`). Id 6, 8, 9 trong
+# STATUE_PALETTE là mục dự phòng, không được gán — nhánh phân cụm màu phải ánh xạ
+# chỉ số cụm qua đây, nếu dùng thẳng 0..6 thì cụm thứ 7 sẽ mang nhãn "Vùng dự phòng A".
+_VISIBLE_PART_IDS = (0, 1, 2, 3, 4, 5, 7)
+
+# Dưới ngưỡng này coi là vật đơn sắc, màu không phân vùng được -> dùng nhánh hình học.
+# Đo trên 5 vật (độ trải chroma = p90 - p10 của |a,b| trong Lab): khủng long 58,3 /
+# linh thú 42,4 / rùa máy 41,1 / robot 18,3, còn chiếc xe chỉ 1,63. Ngưỡng 10 nằm
+# giữa một khoảng trống rộng 11 lần nên không phải con số chọn bừa.
+_MIN_CHROMA_SPREAD = 10.0
+
+
+def _face_colors_lab(mesh: trimesh.Trimesh) -> Optional[np.ndarray]:
+    """Màu Lab tại tâm mỗi mặt, lấy qua UV. Một lượt O(F), không nội suy."""
+    visual = getattr(mesh, "visual", None)
+    uv = getattr(visual, "uv", None)
+    material = getattr(visual, "material", None)
+    tex = getattr(material, "baseColorTexture", None)
+    if uv is None or tex is None or len(uv) != len(mesh.vertices):
+        return None
+
+    from skimage.color import rgb2lab
+
+    image = tex.convert("RGB")
+    width, height = image.size
+    pixels = np.asarray(image, dtype=np.uint8)
+    face_uv = np.asarray(uv, dtype=np.float64)[mesh.faces].mean(axis=1)
+    px = np.clip((face_uv[:, 0] % 1.0) * (width - 1), 0, width - 1).astype(np.int32)
+    py = np.clip((1.0 - (face_uv[:, 1] % 1.0)) * (height - 1), 0, height - 1).astype(np.int32)
+    rgb = pixels[py, px].astype(np.float32) / 255.0
+    return rgb2lab(rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+
+
+def _segment_by_texture_color(
+    mesh: trimesh.Trimesh,
+    texture_source: trimesh.Trimesh,
+    num_clusters: int = 7
+) -> Optional[np.ndarray]:
+    """
+    Gán id vùng theo cụm màu của texture gốc AI, rồi chuyển nhãn về `mesh`.
+
+    Trả None khi không dùng được (thiếu texture, vật đơn sắc, thiếu thư viện) để
+    hàm gọi rơi về nhánh hình học.
+
+    Hai lựa chọn đã đo rồi mới chốt:
+    - `num_clusters` CỐ ĐỊNH 7. Chọn theo silhouette cho đỉnh ở k=3/k=4, nhưng render
+      ra thì k=4 gộp trọn thân con khủng long thành một vùng — tệ hơn cả nhánh hình học.
+      Silhouette đo độ tách trong không gian màu, không đo tính hữu ích khi tô.
+    - Chuyển nhãn bằng KDTree trên tâm mặt (0,21 s, sai số p99 = 0,19 % kích thước mô
+      hình) thay vì `trimesh.proximity.closest_point` (14,2 s cho cùng việc).
+
+    Hạn chế đã biết, KHÔNG chữa: bóng đổ mà AI nướng sẵn vào texture bị tách thành
+    vùng riêng (vệt dọc nếp gấp chân, dưới hàm). Đã thử bỏ kênh L để chỉ phân cụm theo
+    sắc, nhưng độ ổn định tụt (ARI khủng long 0,940 -> 0,798) nên giữ nguyên Lab đủ.
+    """
+    try:
+        from sklearn.cluster import KMeans
+        from scipy.spatial import cKDTree
+    except Exception as err:
+        print(f"[StatueOptimizer] Phân vùng theo màu: thiếu thư viện ({err})")
+        return None
+
+    lab = _face_colors_lab(texture_source)
+    if lab is None:
+        print("[StatueOptimizer] Phân vùng: mesh không có UV/texture -> dùng nhánh hình học")
+        return None
+
+    chroma = np.linalg.norm(lab[:, 1:], axis=1)
+    spread = float(np.percentile(chroma, 90) - np.percentile(chroma, 10))
+    if spread < _MIN_CHROMA_SPREAD:
+        print(f"[StatueOptimizer] Phân vùng: vật đơn sắc (độ trải chroma {spread:.2f} "
+              f"< {_MIN_CHROMA_SPREAD}) -> dùng nhánh hình học")
+        return None
+
+    rng = np.random.RandomState(0)
+    sample = rng.choice(len(lab), min(8000, len(lab)), replace=False)
+    kmeans = KMeans(n_clusters=num_clusters, n_init=10, random_state=0).fit(lab[sample])
+    cluster_ids = kmeans.predict(lab)
+
+    # Nhãn nằm trên mesh có texture; phân vùng chạy trên mesh nền (đã rút gọn, đã thêm
+    # đế) nên số mặt khác nhau -> chiếu theo tâm mặt gần nhất.
+    _, nearest = cKDTree(texture_source.triangles_center).query(mesh.triangles_center, k=1)
+    mapped = np.asarray(_VISIBLE_PART_IDS, dtype=int)[cluster_ids[nearest] % len(_VISIBLE_PART_IDS)]
+    print(f"[StatueOptimizer] Phân vùng theo MÀU TEXTURE: {num_clusters} cụm, "
+          f"độ trải chroma {spread:.2f}")
+    return mapped
+
+
 def segment_statue_parts(
     mesh: trimesh.Trimesh,
-    has_pedestal: bool = False
+    has_pedestal: bool = False,
+    texture_source: Optional[trimesh.Trimesh] = None
 ) -> Dict[str, Any]:
     """
-    Intelligently segments the statue mesh into paintable anatomical/spatial parts:
-    - Head & Face (Đầu & Khuôn mặt)
-    - Hair / Headwear (Tóc / Mũ)
-    - Upper Torso / Clothing (Thân trên / Áo)
-    - Lower Torso / Legs (Thân dưới / Quần / Chân)
-    - Arms & Hands (Tay & Cánh tay)
-    - Pedestal / Base (Đế tượng nếu có)
+    Chia tượng thành 7 vùng đổ màu, theo một trong hai nhánh:
+
+    1. Theo MÀU TEXTURE gốc AI — khi có `texture_source` mang UV + baseColorTexture và
+       vật đủ đa sắc. Ranh giới bám vào chi tiết người tô nhìn thấy.
+    2. Theo HÌNH HỌC (lát cắt chiều cao + bán kính) — nhánh dự phòng khi mesh không có
+       texture hoặc vật đơn sắc (ví dụ xe hơi một màu sơn).
+
+    `texture_source` là mesh CÓ texture; `mesh` là mesh nền đã rút gọn/thêm đế. Hai mesh
+    khác số mặt nên nhãn được chiếu qua tâm mặt gần nhất. Bỏ trống `texture_source` thì
+    luôn đi nhánh hình học.
     """
     v = mesh.vertices.copy()
     f = mesh.faces.copy()
@@ -251,33 +343,51 @@ def segment_statue_parts(
 
     face_part_ids = np.zeros(num_faces, dtype=int)
 
-    if has_pedestal or b_min[1] < 0.05:
-        base_mask = (norm_y <= 0.06)
-        face_part_ids[base_mask] = 7
+    # Ưu tiên phân vùng theo màu texture gốc AI: ranh giới bám vào chi tiết người tô
+    # nhìn thấy (gai lưng, mảng bụng, móng) thay vì cắt ngang theo chiều cao. Đo trên
+    # 5 vật: độ trải toạ độ Y tại ranh giới đạt 0,249-0,282 so với 0,002 của các lát
+    # cắt ngang bên dưới, tức bám hình thật chứ không bám mặt phẳng cố định.
+    # Trả None (thiếu texture / vật đơn sắc) thì rơi xuống nhánh hình học ngay dưới.
+    color_ids = None
+    if texture_source is not None:
+        try:
+            color_ids = _segment_by_texture_color(mesh, texture_source)
+        except Exception as err:
+            print(f"[StatueOptimizer] Phân vùng theo màu thất bại ({err}) -> dùng nhánh hình học")
+    if color_ids is not None:
+        face_part_ids = color_ids
 
-    top_mask = (norm_y > 0.72) & (face_part_ids == 0)
-    if top_mask.sum() > 0:
+    top_mask = np.zeros(num_faces, dtype=bool)
+    if color_ids is None:
+        print("[StatueOptimizer] Phân vùng theo HÌNH HỌC (lát cắt chiều cao)")
+        if has_pedestal or b_min[1] < 0.05:
+            base_mask = (norm_y <= 0.06)
+            face_part_ids[base_mask] = 7
+
+        top_mask = (norm_y > 0.72) & (face_part_ids == 0)
+    if color_ids is None and top_mask.sum() > 0:
         face_mask = top_mask & (face_normals[:, 2] > 0.1) & (radial_dist < radial_dist[top_mask].mean() * 1.1)
         hair_mask = top_mask & (~face_mask)
         face_part_ids[face_mask] = 0
         face_part_ids[hair_mask] = 1
 
-    mid_upper_mask = (norm_y > 0.42) & (norm_y <= 0.72) & (face_part_ids == 0)
-    if mid_upper_mask.sum() > 0:
-        p70 = np.percentile(radial_dist[mid_upper_mask], 70)
-        arms_mask = mid_upper_mask & (radial_dist > p70)
-        torso_mask = mid_upper_mask & (~arms_mask)
-        face_part_ids[torso_mask] = 2
-        face_part_ids[arms_mask] = 4
+    if color_ids is None:
+        mid_upper_mask = (norm_y > 0.42) & (norm_y <= 0.72) & (face_part_ids == 0)
+        if mid_upper_mask.sum() > 0:
+            p70 = np.percentile(radial_dist[mid_upper_mask], 70)
+            arms_mask = mid_upper_mask & (radial_dist > p70)
+            torso_mask = mid_upper_mask & (~arms_mask)
+            face_part_ids[torso_mask] = 2
+            face_part_ids[arms_mask] = 4
 
-    lower_mask = (norm_y <= 0.42) & (face_part_ids == 0)
-    legs_mask = lower_mask & (norm_y > 0.15)
-    feet_mask = lower_mask & (~legs_mask)
-    face_part_ids[legs_mask] = 3
-    face_part_ids[feet_mask] = 5
+        lower_mask = (norm_y <= 0.42) & (face_part_ids == 0)
+        legs_mask = lower_mask & (norm_y > 0.15)
+        feet_mask = lower_mask & (~legs_mask)
+        face_part_ids[legs_mask] = 3
+        face_part_ids[feet_mask] = 5
 
-    unassigned = (face_part_ids == 0) & (~top_mask)
-    face_part_ids[unassigned] = 2
+        unassigned = (face_part_ids == 0) & (~top_mask)
+        face_part_ids[unassigned] = 2
 
     # Topological smoothing of part labels (FaceParsing mesh_segmenter approach)
     if hasattr(mesh, "face_adjacency") and len(mesh.face_adjacency) > 0:
