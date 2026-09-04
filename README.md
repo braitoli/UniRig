@@ -393,35 +393,21 @@ Available models are hosted on the: https://huggingface.co/VAST-AI/UniRig
 
 - For generation: CUDA-enabled GPU with at least 8GB VRAM
 
-### Statue Studio: keeping a model loaded between jobs
+### Statue Studio: TRELLIS via gx10-model-serving
 
-`playground/server.py` loads a generator's model when a job needs it and releases it
-when that job's subprocess exits. Nothing stays in memory in between. That is the right
-default when the machine has one GPU and three generators (TRELLIS.2-4B, Hunyuan3D-2.1,
-Pixal3D) competing for it — and it is required on a unified-memory host such as a GB10,
-where the GPU allocates out of the same RAM the OS uses, so a model parked between jobs
-is memory the next generator cannot have.
+TRELLIS.2-4B generation goes through `gx10-model-serving` — a service shared across every
+project on this GPU host, always resident, standing outside both UniRig and 3d-studio.
+`pipeline/trellis_generator.py` calls it over HTTP (`MODEL_SERVING_URL`, default
+`http://127.0.0.1:7900`); `playground/server.py` no longer loads, evicts, or otherwise
+manages a TRELLIS process itself, since the service's own lifecycle is external to this
+repo. If `gx10-model-serving` is unreachable or a job fails, the job fails with a clear
+error — this repo does not fall back to loading a second in-process copy of TRELLIS.2-4B
+(that would put two ~17-20GB copies in the same unified-memory pool, the exact OOM this
+design avoids). See `docs/superpowers/specs/2026-09-04-gx10-model-serving-design.md` in the `3d-studio`
+repo for the full design (section "Statue Studio" covers this migration).
 
-The cost is a model load per job. Measured on a GB10: TRELLIS.2-4B takes **90.7s** to
-load, and holds **16.8 GB** while resident.
-
-When generating many statues in a row with the same generator, that load is worth
-avoiding:
-
-```bash
-STATUE_RESIDENT_GENERATOR=trellis python playground/server.py
-```
-
-- Unset or empty (default): load on demand, release after each job.
-- `trellis`: keep TRELLIS.2-4B loaded between jobs. A job for any other generator evicts
-  it first — two models do not fit — and it reloads on the next TRELLIS job.
-- Only `trellis` has a resident mode; it is the one generator with a worker service
-  (`pipeline/trellis_worker_service.py`). Hunyuan3D and Pixal3D run as subprocesses and
-  already load on demand, so naming them is accepted but does nothing.
-
-Related: `TRELLIS_PORT` (default `7865`) points the TRELLIS path at a worker on another
-port, which is how you reuse a TRELLIS service shared with another project instead of
-standing up a second copy.
+Hunyuan3D-2.1 and Pixal3D remain subprocess-only and load on demand — out of scope for
+this service (v1 covers TRELLIS only).
 
 ## Citation
 

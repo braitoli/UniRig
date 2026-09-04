@@ -1,8 +1,8 @@
 import os
-import sys
 import time
 import torch
 import numpy as np
+import requests
 from pathlib import Path
 from PIL import Image
 from typing import Optional, Union, Dict, Any
@@ -135,175 +135,88 @@ class TrellisImageTo3DGenerator:
         else:
             input_file_str = str(Path(image_input).resolve())
 
-        mesh_generated = False
-        trellis_python = sys.executable
-        for _candidate in ["/venv/main/bin/python", "/home/braitoli/miniconda/envs/trellis/bin/python"]:
-            if Path(_candidate).exists():
-                trellis_python = _candidate
-                break
-        infer_script = Path(__file__).parent / "trellis2_infer.py"
-
-        # Step 2: Initialize TRELLIS.2-4B
+        # Step 2: Gọi gx10-model-serving — service TRELLIS dùng chung cho các dự án trên
+        # gx10, luôn thường trú (không cần tự quản lý vòng đời model ở phía UniRig nữa).
+        # Xem docs/superpowers/specs/2026-09-04-gx10-model-serving-design.md (repo
+        # 3d-studio). Không có nhánh dự phòng nào khác: nếu service không phản hồi hoặc
+        # job thất bại, raise lỗi rõ ràng — không tự tải một bản TRELLIS.2-4B thứ hai
+        # trong tiến trình này (đó chính là điều gây OOM mà service này sinh ra để diệt).
         report(25, "Khởi tạo mạng nơ-ron Transformer TRELLIS.2-4B...", 2, 5)
 
-        # Check if Persistent GPU Worker is active on port 7865
-        worker_port = int(os.environ.get("TRELLIS_PORT", "7865"))
-        # STATUE_RESIDENT_GENERATOR=trellis means the caller expects the resident worker
-        # to exist. If it doesn't answer, that's a real failure to surface, not a cue to
-        # silently spin up a second 4B model in the same memory pool.
-        resident_mode = os.environ.get("STATUE_RESIDENT_GENERATOR", "").strip().lower() == "trellis"
-        is_worker_online = False
+        base_url = os.environ.get("MODEL_SERVING_URL", "http://127.0.0.1:7900").rstrip("/")
+
         try:
-            import requests
-            r_chk = requests.get(f"http://127.0.0.1:{worker_port}/health", timeout=1.0)
-            if r_chk.status_code == 200 and r_chk.json().get("status") == "online":
-                is_worker_online = True
-        except Exception:
-            is_worker_online = False
-
-        if is_worker_online:
-            try:
-                print(f"[TrellisGenerator] ⚡ FAST PATH: Invoking Warm GPU Worker (port {worker_port})...")
-                import threading
-                call_state = {"done": False, "res": None, "err": None}
-
-                def call_worker():
-                    try:
-                        import requests
-                        payload = {
-                            "image_path": str(input_file_str),
-                            "output_path": str(output_path),
-                            "seed": seed,
-                            "resolution": resolution,
-                            "decimation_target": min(decimate_target, 300000) if decimate_target else 300000,
-                            "texture_size": texture_size,
-                            "tex_slat_steps": tex_slat_steps,
-                            "sparse_structure_steps": sparse_structure_steps,
-                            "shape_slat_steps": shape_slat_steps
-                        }
-                        # Must exceed worst-case bake time (texture_size=4096 measured at ~360s,
-                        # slower when the GPU is shared); a premature timeout drops us onto the
-                        # subprocess path, which reloads the whole 4B model from scratch.
-                        resp = requests.post(f"http://127.0.0.1:{worker_port}/generate", json=payload, timeout=1800)
-
-                        if resp.status_code == 200:
-                            call_state["res"] = resp.json()
-                        else:
-                            call_state["err"] = resp.text
-                    except Exception as e:
-                        call_state["err"] = str(e)
-                    finally:
-                        call_state["done"] = True
-
-                w_thread = threading.Thread(target=call_worker, daemon=True)
-                w_thread.start()
-
-                t_w_start = time.time()
-                # Two terms, because the two detail knobs pay for different things: the
-                # flow-matching pass scales with the grid, the PBR bake with texture area.
-                # A single 360s constant was calibrated for 1024/4096, and left a preview
-                # run sitting at 25% for its whole life.
-                est_duration = (120.0 if str(resolution) == "512" else 240.0) \
-                    + 360.0 * (texture_size / 4096.0) ** 2
-                while not call_state["done"]:
-                    elapsed = time.time() - t_w_start
-                    ratio = min(1.0, elapsed / est_duration)
-                    cur_pct = int(25 + 50 * (1.0 - np.exp(-2.2 * ratio)))
-                    cur_pct = min(75, max(25, cur_pct))
-                    report(cur_pct, "Đang chạy Flow-Matching Latent Slats Diffusion 4B (1024 Cascade)...", 3, 5)
-                    time.sleep(0.3)
-
-                w_thread.join()
-                if call_state["res"] and output_path.exists() and output_path.stat().st_size > 1000:
-                    report(85, "Sinh lưới bề mặt PBR qua O-Voxel và khử đa giác thừa...", 4, 5)
-                    print(f"[TrellisGenerator] ⚡ GPU Worker finished in {call_state['res'].get('total_time_sec', 0)}s!")
-                    mesh_generated = True
-                else:
-                    print(f"[TrellisGenerator] Worker returned error: {call_state.get('err')}, falling back to CLI subprocess...")
-            except Exception as e_w:
-                print(f"[TrellisGenerator] Error calling GPU worker: {e_w}")
-
-        if not mesh_generated and resident_mode:
+            with open(input_file_str, "rb") as f:
+                files = {"image": (Path(input_file_str).name, f, "image/png")}
+                data = {
+                    "seed": str(seed),
+                    "resolution": str(resolution),
+                    "decimate_target": str(min(decimate_target, 300000) if decimate_target else 300000),
+                    "texture_size": str(texture_size),
+                    "tex_slat_steps": str(tex_slat_steps),
+                    "sparse_structure_steps": str(sparse_structure_steps),
+                    "shape_slat_steps": str(shape_slat_steps),
+                }
+                resp = requests.post(f"{base_url}/v1/generate", files=files, data=data, timeout=30)
+        except requests.exceptions.RequestException as e:
             raise RuntimeError(
-                f"Chế độ resident TRELLIS đang bật (STATUE_RESIDENT_GENERATOR=trellis) nhưng "
-                f"worker cổng {worker_port} không sẵn sàng. Không tự động tải thêm một bản "
-                f"TRELLIS.2-4B dự phòng để tránh hai bản model cùng tồn tại trong bộ nhớ — "
-                f"thử lại sau khi worker online, hoặc tắt STATUE_RESIDENT_GENERATOR."
+                f"Không kết nối được tới gx10-model-serving tại {base_url}: {e}. "
+                "Service phải đang chạy trước khi submit job Statue Studio."
+            )
+        if resp.status_code != 202:
+            raise RuntimeError(
+                f"gx10-model-serving từ chối request (HTTP {resp.status_code}): {resp.text}"
+            )
+        job_id = resp.json()["job_id"]
+        print(f"[TrellisGenerator] gx10-model-serving nhận job {job_id}, đang poll trạng thái...")
+
+        # Hai thành phần vì hai tham số chi tiết trả giá khác nhau: diffusion pass scale
+        # theo lưới (resolution), PBR bake scale theo diện tích texture (texture_size).
+        est_duration = (120.0 if str(resolution) == "512" else 240.0) \
+            + 360.0 * (texture_size / 4096.0) ** 2
+        t_poll_start = time.time()
+        job_state = None
+        job_error = None
+        while True:
+            try:
+                status_resp = requests.get(f"{base_url}/v1/jobs/{job_id}", timeout=10)
+                status_resp.raise_for_status()
+                status = status_resp.json()
+            except requests.exceptions.RequestException as e:
+                raise RuntimeError(
+                    f"Mất kết nối tới gx10-model-serving khi đang chờ job {job_id}: {e}"
+                )
+            job_state = status.get("state")
+            if job_state in ("succeeded", "failed"):
+                job_error = status.get("error")
+                break
+            elapsed = time.time() - t_poll_start
+            ratio = min(1.0, elapsed / est_duration)
+            cur_pct = int(25 + 50 * (1.0 - np.exp(-2.2 * ratio)))
+            cur_pct = min(75, max(25, cur_pct))
+            report(cur_pct, "Đang chạy Flow-Matching Latent Slats Diffusion 4B (gx10-model-serving)...", 3, 5)
+            time.sleep(2.0)
+
+        if job_state != "succeeded":
+            raise RuntimeError(
+                f"gx10-model-serving job {job_id} thất bại: {job_error or 'không rõ lý do'}"
             )
 
-        if not mesh_generated and Path(trellis_python).exists() and infer_script.exists():
-            try:
-                print(f"[TrellisGenerator] Invoking TRELLIS.2-4B neural engine via subprocess on {input_file_str}...")
-                import subprocess
-                import threading
+        # Step 4: tải GLB kết quả về đúng đường dẫn output pipeline này mong đợi — service
+        # không ghi vào output_dir do client chỉ định, client phải tự tải qua HTTP.
+        report(85, "Sinh lưới bề mặt PBR qua O-Voxel và khử đa giác thừa...", 4, 5)
+        result_resp = requests.get(f"{base_url}/v1/jobs/{job_id}/result", timeout=120)
+        result_resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(result_resp.content)
 
-                cmd = [
-                    trellis_python,
-                    str(infer_script),
-                    f"--image_path={input_file_str}",
-                    f"--output_path={output_path}",
-                    f"--seed={seed}",
-                    f"--resolution={resolution}",
-                    f"--decimation_target={min(decimate_target, 300000) if decimate_target else 300000}",
-                    # Passed explicitly now: leaving it off meant this fallback path baked at
-                    # trellis2_infer's own 4096 default whatever the worker path was asked for.
-                    f"--texture_size={texture_size}",
-                    f"--tex_slat_steps={tex_slat_steps}",
-                    f"--sparse_structure_steps={sparse_structure_steps}",
-                    f"--shape_slat_steps={shape_slat_steps}",
-                ]
-                env = os.environ.copy()
-                env["PATH"] = f"/home/braitoli/miniconda/envs/trellis/bin:{env.get('PATH', '')}"
-                env["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-                env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-                env["ATTN_BACKEND"] = os.environ.get("ATTN_BACKEND", "sdpa")
-                try:
-                    import xformers
-                    _default_sparse = "xformers"
-                except ImportError:
-                    _default_sparse = "sdpa"
-                env["SPARSE_ATTN_BACKEND"] = os.environ.get("SPARSE_ATTN_BACKEND", _default_sparse)
-
-                proc_state = {"done": False, "res": None}
-
-                def run_sub():
-                    proc_state["res"] = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                    proc_state["done"] = True
-
-                sub_t = threading.Thread(target=run_sub, daemon=True)
-                sub_t.start()
-
-                # Smoothly update progress from 25% to 75% while subprocess is calculating
-                t_sub_start = time.time()
-                est_duration = 18.0
-                while not proc_state["done"]:
-                    elapsed = time.time() - t_sub_start
-                    ratio = min(1.0, elapsed / est_duration)
-                    cur_pct = int(25 + 50 * (1.0 - np.exp(-2.2 * ratio)))
-                    cur_pct = min(75, max(25, cur_pct))
-                    report(cur_pct, "Đang chạy Flow-Matching Latent Slats Diffusion 4B...", 3, 5)
-                    time.sleep(0.4)
-
-                sub_t.join()
-                res = proc_state["res"]
-                if res and res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
-                    report(85, "Sinh lưới bề mặt PBR qua O-Voxel và khử đa giác thừa...", 4, 5)
-                    print(f"[TrellisGenerator] TRELLIS.2-4B successfully generated 3D model ({output_path.stat().st_size / 1024 / 1024:.2f} MB)")
-                    mesh_generated = True
-                else:
-                    print(f"[TrellisGenerator] TRELLIS.2 subprocess returned {getattr(res, 'returncode', -1)}:\n{getattr(res, 'stderr', '')}")
-            except Exception as e:
-                print(f"[TrellisGenerator] Error executing TRELLIS.2 subprocess: {e}")
-
-        # Không dùng mesh dựng hình học giả (SDF từ silhouette 2D) thay thế nữa: cả worker
-        # resident lẫn subprocess tự tải đều thất bại nghĩa là TRELLIS thật sự không sinh
-        # được mesh — báo lỗi rõ ràng để người dùng biết job thất bại, thay vì âm thầm trả
-        # về một kết quả không phải TRELLIS mà trông giống thành công.
-        if not mesh_generated or not output_path.exists():
+        if not output_path.exists() or output_path.stat().st_size <= 1000:
             raise RuntimeError(
-                "TRELLIS.2-4B không sinh được mesh (worker resident và subprocess tự tải đều "
-                "thất bại)."
+                f"gx10-model-serving báo job {job_id} succeeded nhưng file GLB tải về rỗng "
+                f"hoặc quá nhỏ ({output_path})."
             )
+        print(f"[TrellisGenerator] gx10-model-serving hoàn tất job {job_id} trong "
+              f"{time.time() - t_poll_start:.1f}s -> {output_path.stat().st_size / 1024 / 1024:.2f} MB")
 
         # Step 5: Inspect created mesh statistics & auto-orient to upright Y-Up
         report(95, "Căn chỉnh hệ toạ độ Y-Up & chiếu xạ kết cấu màu sắc (UV/Texture)...", 5, 5)

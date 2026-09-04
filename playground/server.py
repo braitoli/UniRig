@@ -2,7 +2,6 @@ import os
 import sys
 import re
 import time
-import threading
 import socket
 import shutil
 import asyncio
@@ -60,107 +59,16 @@ statue_runner = Statue3DPipeline(root_dir=str(ROOT_DIR))
 automation_service = StatueAutomationService(server_port=7860)
 
 
-# Which generator, if any, keeps its model in memory between jobs.
-#
-#   STATUE_RESIDENT_GENERATOR unset/empty  (default)
-#       Nothing stays resident. Every generator loads its model when a job needs it and
-#       gives the memory back when the job's subprocess exits. This is the safe default
-#       on this host: GPU and CPU share one 121 GB pool, so a model parked between jobs
-#       is memory the next generator cannot have. Measured: with the TRELLIS worker
-#       resident, MemFree sat at 14.5 GB and even opening a CUDA context to *query* free
-#       memory failed with an OOM; stopping it returned 15 GB.
-#
-#   STATUE_RESIDENT_GENERATOR=trellis
-#       Keep TRELLIS.2-4B loaded between jobs. Worth it when generating many statues in
-#       a row: it saves the 90.7s that loading TRELLIS.2-4B costs on every job, at the
-#       price of ~16.8 GB held for as long as the server runs. A job for any other
-#       generator evicts it first (see apply_resident_policy) and it reloads on the next
-#       TRELLIS job, because two models will not fit in the pool at once.
-#
-# Only `trellis` has a resident mode to enable -- it is the one generator with a worker
-# service (pipeline/trellis_worker_service.py). Hunyuan3D and Pixal3D are subprocess-only
-# and already load on demand, so naming them here is accepted but does nothing.
-RESIDENT_GENERATOR = os.environ.get("STATUE_RESIDENT_GENERATOR", "").strip().lower()
-_TRELLIS_WORKER_URL = f"http://127.0.0.1:{os.environ.get('TRELLIS_PORT', '7865')}/health"
-
-
-def _trellis_worker_online() -> bool:
-    try:
-        import requests
-        return requests.get(_TRELLIS_WORKER_URL, timeout=0.8).status_code == 200
-    except Exception:
-        return False
-
-
-def start_trellis_worker(wait_s: float = 240.0):
-    """Bring the resident TRELLIS worker up and wait until it reports online.
-
-    Waiting matters: trellis_generator.py only takes the warm path when /health says
-    "online", and falls back to a subprocess that loads TRELLIS.2-4B itself otherwise.
-    Returning early would have the job load its own copy while the worker loads another
-    -- two 16.8 GB copies in a 121 GB pool shared with the GPU, which is the OOM this
-    whole policy exists to avoid. The first job after a cold start therefore pays the
-    90.7s load either way; the jobs after it are the ones residency buys.
-    """
-    trellis_python = "/home/braitoli/miniconda/envs/trellis/bin/python"
-    worker_script = ROOT_DIR / "pipeline" / "trellis_worker_service.py"
-    if not (Path(trellis_python).exists() and worker_script.exists()):
-        return
-    if _trellis_worker_online():
-        return
-    import subprocess
-    print("⚡ Loading the resident TRELLIS GPU worker on port 7865...")
-    t0 = time.time()
-    subprocess.Popen([trellis_python, str(worker_script)],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    while time.time() - t0 < wait_s:
-        if _trellis_worker_online():
-            print(f"⚡ Resident TRELLIS worker online in {time.time() - t0:.1f}s.")
-            return
-        time.sleep(2.0)
-    print(f"⚠️ Resident TRELLIS worker did not come online within {wait_s:.0f}s; "
-          f"this job will load its own copy instead.")
-
-
-# Serialises residency changes. Jobs run in FastAPI's background thread pool, so two
-# submitted together would otherwise be free to start and stop the worker at the same
-# time and leave the pool in whichever state lost the race. It does NOT stop a Pixal3D
-# job from evicting a model a TRELLIS job is actively using -- that job falls back to
-# its subprocess path and still finishes, just slower.
-_residency_lock = threading.Lock()
-
-
-def apply_resident_policy(generator_type: str):
-    """Hold at most one model in memory, and only the one STATUE_RESIDENT_GENERATOR names.
-
-    Called at the top of every job with that job's generator. Never raises: a residency
-    decision going wrong should not take the job down with it.
-    """
-    try:
-        with _residency_lock:
-            wants_trellis = "trellis" in str(generator_type or "").lower()
-            if RESIDENT_GENERATOR == "trellis" and wants_trellis:
-                start_trellis_worker()
-            elif _trellis_worker_pids():
-                # Either residency is off entirely, or it is on for TRELLIS and this job
-                # belongs to someone else. Both cases want the pool back.
-                freed = stop_trellis_worker()
-                print(f"⚡ Released the resident TRELLIS model for this {generator_type} "
-                      f"job: {freed:.1f} GB back.")
-    except Exception as e:
-        print(f"⚠️ Could not apply the resident-model policy: {e}")
+# TRELLIS chạy qua gx10-model-serving (service ngoài, luôn thường trú) kể từ migration
+# 2026-09-05 -- xem docs/superpowers/specs/2026-09-04-gx10-model-serving-design.md trong
+# repo 3d-studio, section "Statue Studio". Không còn khái niệm resident-worker cục bộ cho
+# TRELLIS ở phía UniRig nữa (đã xoá STATUE_RESIDENT_GENERATOR, start_trellis_worker(),
+# apply_resident_policy() cùng trellis_worker_service.py) -- pipeline/trellis_generator.py
+# gọi thẳng service ngoài, không cần server.py quản lý vòng đời model nữa.
 
 
 @app.on_event("startup")
 async def server_startup():
-    if RESIDENT_GENERATOR and RESIDENT_GENERATOR != "trellis":
-        print(f"⚠️ STATUE_RESIDENT_GENERATOR={RESIDENT_GENERATOR!r} has no resident mode; "
-              f"only 'trellis' has a worker service. Loading on demand instead.")
-    elif RESIDENT_GENERATOR == "trellis":
-        print("⚡ STATUE_RESIDENT_GENERATOR=trellis: TRELLIS.2-4B will stay loaded between jobs.")
-    else:
-        print("⚡ Models load on demand and are released when each job ends "
-              "(set STATUE_RESIDENT_GENERATOR=trellis to keep TRELLIS warm).")
     cfg = database.get_automation_config()
     if cfg.get("enabled", False):
         automation_service.start()
@@ -279,9 +187,6 @@ def run_job_background(job_id: str):
                 database.update_job(job_id, status="processing_image_to_3d", stage=0, metadata=metadata)
 
             on_stage0_progress(10, "Bắt đầu tiến trình tạo 3D từ ảnh 2D...", 1, 5)
-            # After the first progress report, because in resident mode this blocks for
-            # the 90.7s the model takes to load and the job would otherwise look queued.
-            apply_resident_policy(generator_choice)
             stage0_res = pipeline_runner.generate_3d_from_image(
                 image_path=input_file,
                 output_dir=str(job_dir / gen_folder),
@@ -1163,9 +1068,6 @@ def run_statue_job_background(job_id: str):
         
     try:
         on_progress(5, "Đang khởi tạo pipeline tạo tượng 3D...", 1, 5)
-        # After the first progress report, because in resident mode this blocks for the
-        # 90.7s the model takes to load and the job would otherwise sit at "queued".
-        apply_resident_policy(job.get("generator_type", "trellis"))
         res = statue_runner.process_statue(
             input_path=input_file,
             output_dir=str(job_dir),
