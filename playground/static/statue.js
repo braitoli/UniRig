@@ -14,14 +14,10 @@ const state = {
     selectedFile: null,
     activeJobId: null,
     currentJobData: null,
-    activeMode: 'painted', // 'painted', 'plaster', 'segmented', 'textured', 'wireframe'
+    activeMode: 'segmented', // 'plaster', 'segmented', 'textured', 'wireframe'
     currentGlbUrl: null,
-    paintTool: 'bucket',   // 'bucket', 'brush', 'eraser'
-    currentColor: '#FF5722',
-    currentFinish: 'ceramic_glossy',
     isPainting: false,
     originalMaterialsMap: new Map(),
-    paintedMaterialsMap: new Map(),
     submeshPartsMap: new Map(),
     animMixer: null,
     animClips: [],
@@ -30,14 +26,6 @@ const state = {
     automationConfig: null,
     modelRotation: { rx: 0, ry: 0, rz: 0 }
 };
-
-// 24 Standard Vibrant Statue Painting Colors
-const STATUE_COLORS = [
-    '#FFE0BD', '#795548', '#4FC3F7', '#81C784', '#FFB74D', '#BA68C8',
-    '#FFD54F', '#90A4AE', '#E57373', '#4DD0E1', '#F44336', '#E91E63',
-    '#9C27B0', '#673AB7', '#3F51B5', '#2196F3', '#00BCD4', '#009688',
-    '#4CAF50', '#8BC34A', '#CDDC39', '#FFEB3B', '#FF9800', '#FFFFFF'
-];
 
 // Rich Sample Presets for Instant 2D Image Selection & Instant 3D Painting Preview (100% Matched 2D & 3D)
 const SAMPLE_PRESETS = {
@@ -127,10 +115,19 @@ const SAMPLE_PRESETS = {
 let scene, camera, renderer, controls, currentModel, gridHelper, dirLight;
 let raycaster, mouse;
 
+// Độ sáng khung nhìn 3D: nhân cường độ TẤT CẢ nguồn sáng với 1 hệ số, không đụng vật liệu model.
+const BRIGHTNESS_STORAGE_KEY = 'statue_brightness_factor';
+let brightnessLights = []; // [{ light, baseIntensity }] — nạp lại ở initThreeJS()
+let brightnessFactor = 1.0;
+
 document.addEventListener('DOMContentLoaded', () => {
-    initThreeJS();
-    initUIEvents();
-    initPalette();
+    // Mỗi bước bọc try/catch riêng: nếu một hàm ném lỗi (ví dụ tham chiếu tới
+    // phần tử DOM đã bị đổi/xóa), các bước còn lại - đặc biệt loadStatueHistory() -
+    // vẫn phải chạy, thay vì cả DOMContentLoaded bị chặn đứng giữa chừng và
+    // khiến khối "Lịch Sử Tạo Tượng" trông như trống rỗng dù dữ liệu vẫn còn.
+    try { initThreeJS(); } catch (e) { console.error('initThreeJS failed:', e); }
+    try { initUIEvents(); } catch (e) { console.error('initUIEvents failed:', e); }
+    try { setupDownloadPreviewHovers(); } catch (e) { console.error('setupDownloadPreviewHovers failed:', e); }
     loadAutomationStatus();
     loadStatueHistory();
     setInterval(loadAutomationStatus, 4000);
@@ -203,6 +200,12 @@ function initThreeJS() {
     rimLight.position.set(0, 5, -4);
     scene.add(rimLight);
 
+    // Ghi lại cường độ gốc của từng nguồn sáng để thanh trượt "Độ sáng" nhân hệ số lên,
+    // không đụng tới vật liệu model.
+    brightnessLights = [ambientLight, dirLight, fillLight, frontLight, rimLight]
+        .map((light) => ({ light, baseIntensity: light.intensity }));
+    applyBrightnessFactor(brightnessFactor);
+
     // Ground Grid & Shadow Receiver Plane
     const floorGeo = new THREE.PlaneGeometry(20, 20);
     const floorMat = new THREE.ShadowMaterial({ opacity: 0.35 });
@@ -216,15 +219,12 @@ function initThreeJS() {
     gridHelper.position.y = 0.001;
     scene.add(gridHelper);
 
-    // Raycaster for Painting Click Detection
+    // Raycaster for hover tooltip / part highlight detection
     raycaster = new THREE.Raycaster();
     mouse = new THREE.Vector2();
 
-    renderer.domElement.addEventListener('pointerdown', onCanvasPointerDown);
-    renderer.domElement.addEventListener('pointermove', onCanvasPointerMove);
+    renderer.domElement.addEventListener('pointermove', onCanvasPointerHover);
     renderer.domElement.addEventListener('pointerleave', clearHoverHighlight);
-    window.addEventListener('pointerup', onCanvasPointerUp);
-    window.addEventListener('pointercancel', onCanvasPointerUp);
 
     // Window Resize
     window.addEventListener('resize', () => {
@@ -249,83 +249,15 @@ function initThreeJS() {
     animate();
 }
 
-/* ===================================================
-   2. Palette & Tool Bar Initialization
-   =================================================== */
-function initPalette() {
-    const paletteContainer = document.getElementById('palette-colors');
-    paletteContainer.innerHTML = '';
-
-    STATUE_COLORS.forEach((colorHex, idx) => {
-        const swatch = document.createElement('div');
-        swatch.className = 'color-swatch' + (idx === 0 ? ' active' : '');
-        swatch.style.backgroundColor = colorHex;
-        swatch.dataset.color = colorHex;
-        swatch.addEventListener('click', () => {
-            document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
-            swatch.classList.add('active');
-            state.currentColor = colorHex;
-            document.getElementById('custom-color-input').value = colorHex;
-            if (state.activeMode !== 'painted') {
-                updateViewMode('painted', true);
-            }
-        });
-        paletteContainer.appendChild(swatch);
+function applyBrightnessFactor(factor) {
+    brightnessFactor = factor;
+    brightnessLights.forEach(({ light, baseIntensity }) => {
+        light.intensity = baseIntensity * factor;
     });
-
-    // Custom Color Input
-    const customPicker = document.getElementById('custom-color-input');
-    customPicker.addEventListener('input', (e) => {
-        state.currentColor = e.target.value;
-        document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
-        if (state.activeMode !== 'painted') {
-            updateViewMode('painted', true);
-        }
-    });
-
-    // Finish Material Preset
-    const finishSelect = document.getElementById('material-finish-select');
-    finishSelect.addEventListener('change', (e) => {
-        state.currentFinish = e.target.value;
-        applyCurrentFinishToPaintedModel();
-    });
-}
-
-let isPointerDraggingPaint = false;
-
-function onCanvasPointerDown(event) {
-    if (!currentModel) return;
-    if (event.button !== 0) return; // Only left click
-
-    // If currently in another view mode (e.g. textured/segmented/plaster), auto switch to painted mode
-    if (state.activeMode !== 'painted') {
-        updateViewMode('painted', true);
-    }
-
-    const hitMesh = getIntersectedMesh(event);
-    if (hitMesh) {
-        applyPaintAction(hitMesh);
-        if (state.paintTool === 'brush' || state.paintTool === 'eraser') {
-            isPointerDraggingPaint = true;
-            if (controls) controls.enabled = false; // Disable orbit camera during brush drag
-        }
-    }
 }
 
 let hoveredMesh = null;
 let originalHoverEmissive = null;
-
-function onCanvasPointerMove(event) {
-    if (!currentModel) return;
-    if (isPointerDraggingPaint && (state.paintTool === 'brush' || state.paintTool === 'eraser')) {
-        const hitMesh = getIntersectedMesh(event);
-        if (hitMesh) {
-            applyPaintAction(hitMesh);
-        }
-    } else {
-        onCanvasPointerHover(event);
-    }
-}
 
 function onCanvasPointerHover(event) {
     if (!currentModel || !renderer) return;
@@ -381,13 +313,6 @@ function highlightSidebarPart(name) {
     });
 }
 
-function onCanvasPointerUp() {
-    if (isPointerDraggingPaint) {
-        isPointerDraggingPaint = false;
-        if (controls) controls.enabled = true; // Re-enable orbit camera
-    }
-}
-
 function getIntersectedMesh(event) {
     if (!currentModel || !renderer) return null;
     const rect = renderer.domElement.getBoundingClientRect();
@@ -400,15 +325,6 @@ function getIntersectedMesh(event) {
         return intersects[0].object;
     }
     return null;
-}
-
-function applyPaintAction(mesh) {
-    if (!mesh || !mesh.isMesh) return;
-    if (state.paintTool === 'bucket' || state.paintTool === 'brush') {
-        paintSubmesh(mesh, state.currentColor);
-    } else if (state.paintTool === 'eraser') {
-        resetSubmeshToPlaster(mesh);
-    }
 }
 
 function getPBRMaterialForColor(hexColor, finishType) {
@@ -435,47 +351,7 @@ function getPBRMaterialForColor(hexColor, finishType) {
     });
 }
 
-function paintSubmesh(mesh, hexColor) {
-    if (!mesh || !mesh.isMesh) return;
-    const newMat = getPBRMaterialForColor(hexColor, state.currentFinish);
-    mesh.material = newMat;
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    state.paintedMaterialsMap.set(mesh.uuid, newMat);
-
-    // Trigger subtle bounce feedback on painted part
-    const origScale = mesh.scale.clone();
-    mesh.scale.multiplyScalar(1.02);
-    setTimeout(() => { mesh.scale.copy(origScale); }, 100);
-}
-
-function resetSubmeshToPlaster(mesh) {
-    if (!mesh || !mesh.isMesh) return;
-    const plasterMat = getPBRMaterialForColor('#F0EFEB', 'plaster');
-    mesh.material = plasterMat;
-    state.paintedMaterialsMap.set(mesh.uuid, plasterMat);
-}
-
-function resetAllPaintedColors() {
-    if (!currentModel) return;
-    currentModel.traverse((child) => {
-        if (child.isMesh) {
-            resetSubmeshToPlaster(child);
-        }
-    });
-}
-
-function applyCurrentFinishToPaintedModel() {
-    if (!currentModel) return;
-    currentModel.traverse((child) => {
-        if (child.isMesh && child.material && child.material.color) {
-            const hex = '#' + child.material.color.getHexString();
-            child.material = getPBRMaterialForColor(hex, state.currentFinish);
-        }
-    });
-}
-
-function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
+function load3DStatueModel(glbUrl, mode = 'segmented', statueName = '', fallbackUrl = null, fallbackMode = null) {
     showCanvasLoader('Đang tải tượng 3D...');
     state.currentGlbUrl = glbUrl;
     if (statueName) state.currentStatueName = statueName;
@@ -492,7 +368,6 @@ function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
 
         currentModel = gltf.scene;
         state.originalMaterialsMap.clear();
-        state.paintedMaterialsMap.clear();
 
         // Enable shadows, compute normals, and store materials
         currentModel.traverse((child) => {
@@ -508,12 +383,6 @@ function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
                 if (child.material) {
                     child.material.side = THREE.DoubleSide;
                     state.originalMaterialsMap.set(child.uuid, child.material.clone());
-                    // In painted mode, if no user painting exists yet, initialize with pure plaster white
-                    if (!child.material.map && mode === 'painted') {
-                        const plasterMat = getPBRMaterialForColor('#F0EFEB', state.currentFinish);
-                        child.material = plasterMat;
-                        state.paintedMaterialsMap.set(child.uuid, plasterMat);
-                    }
                 }
             }
         });
@@ -540,7 +409,10 @@ function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
         }
 
         document.getElementById('empty-viewport-hint').style.display = 'none';
-        document.getElementById('painting-bar').style.display = 'flex';
+
+        // Áp lại hệ số Độ sáng đang chọn — phòng trường hợp lights bị tạo/gán lại sau này,
+        // để kéo xong rồi nạp model mới không bị mất lựa chọn.
+        applyBrightnessFactor(brightnessFactor);
 
         try {
             updateViewMode(mode, false);
@@ -555,6 +427,13 @@ function load3DStatueModel(glbUrl, mode = 'painted', statueName = '') {
             document.getElementById('canvas-loader-text').innerText = `Đang tải: ${pct}%`;
         }
     }, (error) => {
+        // Vi du: job co san textured_glb (HEAD 2xx) nhung file thuc te khong doc duoc
+        // (hong, khong dung dinh dang GLB...) -> lui ve ban du phong thay vi vo trang.
+        if (fallbackUrl) {
+            console.warn(`Không nạp được ${glbUrl} (GLTFLoader lỗi), lùi về bản dự phòng: ${fallbackUrl}`, error);
+            load3DStatueModel(fallbackUrl, fallbackMode, statueName);
+            return;
+        }
         hideCanvasLoader();
         console.error('Error loading GLB:', error);
         alert('Không thể tải file GLB: ' + error);
@@ -569,8 +448,8 @@ function updateViewMode(mode, reloadModel = false) {
 
     if (!currentModel) return;
 
-    // If returning from textured mode to painted/segmented/plaster, reload segmented model if needed
-    if ((mode === 'painted' || mode === 'segmented' || mode === 'plaster') && reloadModel) {
+    // If returning from textured mode to segmented/plaster, reload segmented model if needed
+    if ((mode === 'segmented' || mode === 'plaster') && reloadModel) {
         let segUrl = null;
         if (state.activeJobId) {
             segUrl = `/api/statue/jobs/${state.activeJobId}/files/segmented_glb`;
@@ -583,16 +462,7 @@ function updateViewMode(mode, reloadModel = false) {
         }
     }
 
-    if (mode === 'painted') {
-        currentModel.traverse((child) => {
-            if (child.isMesh) {
-                if (child.material) child.material.wireframe = false;
-                const painted = state.paintedMaterialsMap.get(child.uuid);
-                if (painted) child.material = painted;
-                else child.material = getPBRMaterialForColor('#F0EFEB', state.currentFinish);
-            }
-        });
-    } else if (mode === 'plaster') {
+    if (mode === 'plaster') {
         currentModel.traverse((child) => {
             if (child.isMesh) {
                 if (child.material) child.material.wireframe = false;
@@ -624,8 +494,16 @@ function updateViewMode(mode, reloadModel = false) {
             }
         }
         currentModel.traverse((child) => {
-            if (child.isMesh && child.material) {
-                child.material.wireframe = false;
+            if (child.isMesh) {
+                // Khôi phục vật liệu gốc (có texture) của model đang nạp — nếu chỉ tắt
+                // wireframe trên child.material hiện tại thì khi vừa ở mode plaster
+                // material đã bị ghi đè thành thạch cao trắng, tượng sẽ kẹt trắng vĩnh viễn.
+                const orig = state.originalMaterialsMap.get(child.uuid);
+                if (orig) {
+                    child.material = orig.clone();
+                    child.material.side = THREE.DoubleSide;
+                }
+                if (child.material) child.material.wireframe = false;
             }
         });
     } else if (mode === 'wireframe') {
@@ -663,24 +541,6 @@ function playAnimation(index) {
     state.activeAction.play();
     state.isAnimPlaying = true;
     document.getElementById('btn-play-pause').innerHTML = '<i class="fa-solid fa-pause"></i>';
-}
-
-/* ===================================================
-   5. Export Client-Side Painted GLB
-   =================================================== */
-function exportPaintedGLB() {
-    if (!currentModel) {
-        alert('Chưa có tượng 3D để xuất!');
-        return;
-    }
-    const exporter = new THREE.GLTFExporter();
-    exporter.parse(currentModel, (glbBuffer) => {
-        const blob = new Blob([glbBuffer], { type: 'model/gltf-binary' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `statue_custom_painted_${Date.now()}.glb`;
-        link.click();
-    }, { binary: true });
 }
 
 /* ===================================================
@@ -753,7 +613,7 @@ function initUIEvents() {
 
             // 3. If preset has ready-made 3D statue model, load into Three.js immediately!
             if (preset.model) {
-                load3DStatueModel(preset.model, 'painted', preset.name);
+                load3DStatueModel(preset.model, 'segmented', preset.name);
 
                 // Update Stats Panel
                 document.getElementById('stat-vertices').innerText = (preset.vertices || 0).toLocaleString();
@@ -765,11 +625,24 @@ function initUIEvents() {
                 renderPartsList(preset.parts || []);
 
                 // Enable direct downloads for preset model
-                document.getElementById('dl-plaster').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_plaster.glb'), '_blank');
-                document.getElementById('dl-segmented').onclick = () => window.open(preset.model, '_blank');
-                document.getElementById('dl-textured').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_textured.glb'), '_blank');
-                document.getElementById('dl-shell').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_shell.glb'), '_blank');
-                document.getElementById('dl-shell-optimized').onclick = () => window.open(preset.model.replace('statue_segmented.glb', 'statue_shell_optimized.glb'), '_blank');
+                // Gán thêm .href = đúng URL đã truyền cho window.open, để hover-preview đọc được;
+                // onclick vẫn preventDefault() rồi tự window.open như cũ, tránh href thật (thay vì "#")
+                // bị anchor target="_blank" tự mở thêm 1 tab thứ hai của cùng file.
+                const dlPresetUrls = {
+                    'dl-plaster': preset.model.replace('statue_segmented.glb', 'statue_plaster.glb'),
+                    'dl-segmented': preset.model,
+                    'dl-textured': preset.model.replace('statue_segmented.glb', 'statue_textured.glb'),
+                    'dl-shell': preset.model.replace('statue_segmented.glb', 'statue_shell.glb'),
+                    'dl-shell-optimized': preset.model.replace('statue_segmented.glb', 'statue_shell_optimized.glb'),
+                };
+                Object.entries(dlPresetUrls).forEach(([id, url]) => {
+                    const el = document.getElementById(id);
+                    el.href = url;
+                    el.onclick = (e) => {
+                        e.preventDefault();
+                        window.open(url, '_blank');
+                    };
+                });
             }
         });
     });
@@ -799,16 +672,6 @@ function initUIEvents() {
         btn.addEventListener('click', () => updateViewMode(btn.dataset.mode, true));
     });
 
-    // Painting Tools
-    document.getElementById('tool-bucket').addEventListener('click', () => setPaintTool('bucket'));
-    document.getElementById('tool-brush').addEventListener('click', () => setPaintTool('brush'));
-    document.getElementById('tool-eraser').addEventListener('click', () => setPaintTool('eraser'));
-    document.getElementById('btn-reset-paint').addEventListener('click', resetAllPaintedColors);
-    document.getElementById('dl-painted').addEventListener('click', (e) => {
-        e.preventDefault();
-        exportPaintedGLB();
-    });
-
     // Viewport Helper Buttons
     document.getElementById('btn-reset-camera').addEventListener('click', () => {
         if (currentModel) {
@@ -831,6 +694,23 @@ function initUIEvents() {
         link.download = `statue_preview_${Date.now()}.png`;
         link.href = imgData;
         link.click();
+    });
+
+    // Thanh trượt Độ sáng khung nhìn 3D — khôi phục từ localStorage nếu có, mặc định 1.0
+    // (đúng hiện trạng cường độ đèn ban đầu, không đổi trải nghiệm ngoài ý muốn).
+    const brightnessSlider = document.getElementById('brightness-slider');
+    const brightnessValueLabel = document.getElementById('brightness-value');
+    const savedBrightness = parseFloat(localStorage.getItem(BRIGHTNESS_STORAGE_KEY));
+    const initialBrightness = (!isNaN(savedBrightness) && savedBrightness >= 0.4 && savedBrightness <= 2.5)
+        ? savedBrightness : 1.0;
+    brightnessSlider.value = initialBrightness;
+    brightnessValueLabel.textContent = initialBrightness.toFixed(1) + 'x';
+    applyBrightnessFactor(initialBrightness);
+    brightnessSlider.addEventListener('input', () => {
+        const factor = parseFloat(brightnessSlider.value);
+        brightnessValueLabel.textContent = factor.toFixed(1) + 'x';
+        applyBrightnessFactor(factor);
+        localStorage.setItem(BRIGHTNESS_STORAGE_KEY, String(factor));
     });
 
     // Animation Controls
@@ -932,7 +812,6 @@ function setStudioEngine(engine) {
 
     const canvasContainer = document.getElementById('canvas-container');
     const iframeContainer = document.getElementById('iframe-3dpainting-container');
-    const paintingBar = document.getElementById('painting-bar');
     const viewModes = document.getElementById('view-modes-container');
     const viewLabel = document.getElementById('view-mode-label');
     const previewControls = document.getElementById('preview-controls-group');
@@ -940,7 +819,6 @@ function setStudioEngine(engine) {
 
     if (is3D) {
         canvasContainer.style.display = 'none';
-        paintingBar.style.display = 'none';
         iframeContainer.style.display = 'flex';
         viewModes.style.display = 'none';
         if (viewLabel) viewLabel.style.display = 'none';
@@ -949,7 +827,6 @@ function setStudioEngine(engine) {
         syncModelTo3DPaintingIframe();
     } else {
         canvasContainer.style.display = 'block';
-        paintingBar.style.display = 'flex';
         iframeContainer.style.display = 'none';
         viewModes.style.display = 'flex';
         if (viewLabel) viewLabel.style.display = 'inline-flex';
@@ -1065,28 +942,6 @@ function syncModelTo3DPaintingIframe(forceReload = false) {
     } catch (e) {}
 }
 
-function setPaintTool(tool) {
-    state.paintTool = tool;
-    document.querySelectorAll('.paint-tool-btn').forEach(btn => btn.classList.remove('active'));
-    if (tool === 'bucket') {
-        document.getElementById('tool-bucket').classList.add('active');
-        if (renderer && renderer.domElement) renderer.domElement.style.cursor = 'default';
-    }
-    if (tool === 'brush') {
-        document.getElementById('tool-brush').classList.add('active');
-        if (renderer && renderer.domElement) renderer.domElement.style.cursor = 'crosshair';
-    }
-    if (tool === 'eraser') {
-        document.getElementById('tool-eraser').classList.add('active');
-        if (renderer && renderer.domElement) renderer.domElement.style.cursor = 'cell';
-    }
-
-    // Auto-switch to painted mode if currently in another view mode (e.g. textured/segmented/plaster)
-    if (state.activeMode !== 'painted') {
-        updateViewMode('painted', true);
-    }
-}
-
 function handleFileSelected(file) {
     state.selectedFile = file;
     const reader = new FileReader();
@@ -1111,7 +966,6 @@ async function startStatueGeneration() {
     const meshDetail = document.querySelector('#mesh-detail-control .segment-btn.active').dataset.val;
     const targetFaces = document.getElementById('target-faces-select').value;
     const pedestalShape = document.getElementById('pedestal-shape-select').value;
-    const enableRigging = document.getElementById('enable-rigging-checkbox').checked;
 
     const formData = new FormData();
     formData.append('file', state.selectedFile);
@@ -1121,7 +975,6 @@ async function startStatueGeneration() {
     formData.append('target_faces', targetFaces);
     formData.append('pedestal_shape', pedestalShape);
     formData.append('orientation', document.getElementById('statue-orientation-select')?.value || 'auto');
-    formData.append('enable_rigging', enableRigging);
 
     const btn = document.getElementById('btn-generate-statue');
     btn.disabled = true;
@@ -1173,7 +1026,7 @@ async function pollStatueProgress(jobId) {
     }, 1500);
 }
 
-function onStatueJobCompleted(job) {
+async function onStatueJobCompleted(job) {
     resetGenerateButton();
     state.currentJobData = job;
 
@@ -1183,7 +1036,10 @@ function onStatueJobCompleted(job) {
     document.getElementById('stat-parts').innerText = job.num_parts || 0;
     document.getElementById('stat-duration').innerText = `${job.duration_sec || 0}s`;
 
-    // Update download buttons
+    // Update download buttons (xoá onclick còn sót lại từ preset chip, nếu không nó sẽ
+    // tiếp tục mở file preset thay vì file của job đang chọn)
+    ['dl-plaster', 'dl-segmented', 'dl-textured', 'dl-shell', 'dl-shell-optimized', 'dl-package']
+        .forEach(id => { document.getElementById(id).onclick = null; });
     document.getElementById('dl-plaster').href = `/api/statue/jobs/${job.id}/files/plaster_glb`;
     document.getElementById('dl-segmented').href = `/api/statue/jobs/${job.id}/files/segmented_glb`;
     document.getElementById('dl-textured').href = `/api/statue/jobs/${job.id}/files/textured_glb`;
@@ -1195,8 +1051,24 @@ function onStatueJobCompleted(job) {
     const parts = (job.metadata && job.metadata.mesh_stats && job.metadata.mesh_stats.parts) || [];
     renderPartsList(parts);
 
-    // Load segmented or plaster model into 3D view
-    load3DStatueModel(`/api/statue/jobs/${job.id}/files/segmented_glb`, 'painted');
+    // Mặc định xem bản chất lượng cao nhất (có texture AI thật) khi mở job/lịch sử.
+    // Không phải job nào cũng có bản texture (generator xuất mesh trắng, hoặc job cũ
+    // thiếu file) nên phải HEAD-check trước, và luôn truyền fallback về bản phân vùng
+    // (segmented) cho load3DStatueModel để tự lùi nếu GLTFLoader nạp thất bại.
+    const segmentedUrl = `/api/statue/jobs/${job.id}/files/segmented_glb`;
+    const texturedUrl = `/api/statue/jobs/${job.id}/files/textured_glb`;
+    try {
+        const headRes = await fetch(texturedUrl, { method: 'HEAD' });
+        if (headRes.ok) {
+            load3DStatueModel(texturedUrl, 'textured', '', segmentedUrl, 'segmented');
+        } else {
+            console.warn(`Job ${job.id} không có bản textured_glb (HTTP ${headRes.status}), dùng bản phân vùng.`);
+            load3DStatueModel(segmentedUrl, 'segmented');
+        }
+    } catch (e) {
+        console.warn(`Không kiểm tra được textured_glb cho job ${job.id}, dùng bản phân vùng.`, e);
+        load3DStatueModel(segmentedUrl, 'segmented');
+    }
     loadStatueHistory();
 }
 
@@ -1386,4 +1258,163 @@ function showCanvasLoader(msg) {
 
 function hideCanvasLoader() {
     document.getElementById('canvas-loader').style.display = 'none';
+}
+
+/* ===================================================
+   9. Hover Preview Cho Các Nút Tải Về GLB (render 3D thật)
+   =================================================== */
+const DL_PREVIEW_IDS = ['dl-plaster', 'dl-segmented', 'dl-textured', 'dl-shell', 'dl-shell-optimized'];
+const dlPreviewImgCache = new Map();  // url -> data URL (PNG render)
+const dlPreviewSizeCache = new Map(); // url -> chuỗi dung lượng đã format
+let dlPreviewRenderer = null;
+let dlPreviewScene = null;
+let dlPreviewCamera = null;
+let dlPreviewToken = 0; // tăng dần mỗi lần hover mục mới, để huỷ kết quả nạp cũ nếu người dùng đã rê đi
+
+function ensureDlPreviewRenderer() {
+    if (dlPreviewRenderer) return;
+    dlPreviewRenderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    dlPreviewRenderer.setSize(360, 360);
+    dlPreviewRenderer.outputEncoding = THREE.sRGBEncoding;
+    dlPreviewRenderer.setClearColor(0x11151f, 1);
+
+    dlPreviewScene = new THREE.Scene();
+    dlPreviewScene.background = new THREE.Color(0x11151f);
+    dlPreviewScene.add(new THREE.AmbientLight(0xffffff, 1.1));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(2, 3, 4); // đặt cùng phía camera
+    dlPreviewScene.add(dirLight);
+
+    dlPreviewCamera = new THREE.PerspectiveCamera(45, 1, 0.05, 100);
+}
+
+function formatDlPreviewSize(bytes) {
+    if (!bytes || bytes <= 0) return '';
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 0.1) return mb.toFixed(1).replace('.', ',') + ' MB';
+    return Math.round(bytes / 1024) + ' KB';
+}
+
+function renderDlPreviewImage(url) {
+    return new Promise((resolve, reject) => {
+        ensureDlPreviewRenderer();
+        const loader = new THREE.GLTFLoader();
+        loader.load(url, (gltf) => {
+            const obj = gltf.scene;
+            dlPreviewScene.add(obj);
+
+            const bbox = new THREE.Box3().setFromObject(obj);
+            const center = bbox.getCenter(new THREE.Vector3());
+            const size = bbox.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z) || 1;
+
+            obj.position.set(-center.x, -center.y, -center.z);
+            dlPreviewCamera.position.set(0, maxDim * 0.15, maxDim * 2.2);
+            dlPreviewCamera.lookAt(0, 0, 0);
+
+            dlPreviewRenderer.render(dlPreviewScene, dlPreviewCamera);
+            const imgData = dlPreviewRenderer.domElement.toDataURL('image/png');
+
+            // Dọn dẹp model tạm khỏi scene dùng chung, tránh chồng lên lần preview kế tiếp
+            dlPreviewScene.remove(obj);
+            obj.traverse((child) => {
+                if (child.isMesh) {
+                    if (child.geometry) child.geometry.dispose();
+                    const mats = Array.isArray(child.material) ? child.material : [child.material];
+                    mats.forEach((m) => {
+                        if (!m) return;
+                        if (m.map) m.map.dispose();
+                        m.dispose();
+                    });
+                }
+            });
+
+            resolve(imgData);
+        }, undefined, (err) => reject(err));
+    });
+}
+
+function positionDlPreviewPanel(anchorEl) {
+    const panel = document.getElementById('dl-preview-panel');
+    const rect = anchorEl.getBoundingClientRect();
+    const panelWidth = panel.offsetWidth || 300;
+    const panelHeight = panel.offsetHeight || 340;
+
+    // Cột tải nằm sát mép phải màn hình -> panel phải mở sang trái, không tràn viewport
+    let left = rect.left - panelWidth - 14;
+    if (left < 8) left = 8;
+
+    let top = rect.top + rect.height / 2 - panelHeight / 2;
+    top = Math.max(8, Math.min(top, window.innerHeight - panelHeight - 8));
+
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+}
+
+function hideDlPreviewPanel() {
+    document.getElementById('dl-preview-panel').style.display = 'none';
+}
+
+async function showDlPreviewFor(btnEl) {
+    const url = btnEl.getAttribute('href');
+    if (!url || url === '#') return;
+
+    const myToken = ++dlPreviewToken;
+    const panel = document.getElementById('dl-preview-panel');
+    const imgEl = document.getElementById('dl-preview-img');
+    const loadingEl = document.getElementById('dl-preview-loading');
+    const nameEl = document.getElementById('dl-preview-name');
+    const sizeEl = document.getElementById('dl-preview-size');
+
+    nameEl.textContent = btnEl.querySelector('.dl-title')?.textContent || '';
+    sizeEl.textContent = dlPreviewSizeCache.get(url) || '';
+    panel.style.display = 'flex';
+    positionDlPreviewPanel(btnEl);
+
+    if (!dlPreviewSizeCache.has(url)) {
+        fetch(url, { method: 'HEAD' }).then((res) => {
+            const len = parseInt(res.headers.get('content-length') || '0', 10);
+            const sizeText = formatDlPreviewSize(len);
+            dlPreviewSizeCache.set(url, sizeText);
+            if (myToken === dlPreviewToken) sizeEl.textContent = sizeText;
+        }).catch(() => { /* bỏ qua, không để vỡ preview */ });
+    }
+
+    if (dlPreviewImgCache.has(url)) {
+        imgEl.src = dlPreviewImgCache.get(url);
+        imgEl.style.display = 'block';
+        loadingEl.style.display = 'none';
+        positionDlPreviewPanel(btnEl);
+        return;
+    }
+
+    imgEl.style.display = 'none';
+    loadingEl.style.display = 'block';
+    loadingEl.textContent = 'Đang dựng xem trước...';
+
+    try {
+        const imgData = await renderDlPreviewImage(url);
+        if (myToken !== dlPreviewToken) return; // người dùng đã rê sang mục khác, bỏ kết quả cũ
+        dlPreviewImgCache.set(url, imgData);
+        imgEl.src = imgData;
+        imgEl.style.display = 'block';
+        loadingEl.style.display = 'none';
+        positionDlPreviewPanel(btnEl);
+    } catch (err) {
+        if (myToken !== dlPreviewToken) return;
+        loadingEl.textContent = 'Không tạo được xem trước';
+        console.warn('Không tải được model để xem trước:', url, err);
+    }
+}
+
+function setupDownloadPreviewHovers() {
+    DL_PREVIEW_IDS.forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('mouseenter', () => showDlPreviewFor(el));
+        el.addEventListener('mouseleave', () => {
+            dlPreviewToken++; // huỷ kết quả của lần nạp đang dang dở
+            hideDlPreviewPanel();
+        });
+    });
 }

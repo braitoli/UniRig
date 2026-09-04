@@ -68,3 +68,6 @@ external/
 temp_input_image.png
 tmp_*.glb
 tests/*.png
+# Model GLB mau cua 3D Statue Studio: du lieu dan xuat, dung lai duoc bang
+# backfill_statue_shells.py. Khong theo doi de khoi phinh lich su repo (~94 MB).
+playground/static/sample_presets/models/

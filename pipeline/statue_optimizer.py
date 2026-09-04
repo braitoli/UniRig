@@ -21,6 +21,7 @@ import trimesh
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from PIL import Image
+from io import BytesIO
 
 STATUE_PALETTE = [
     {"name": "Đầu / Khuôn mặt (Head)", "hex": "#FFE0BD", "rgb": [255, 224, 189]},
@@ -115,6 +116,14 @@ def auto_ground_and_orient(
     if flatten_bottom:
         y_threshold = v[:, 1].min() + (v[:, 1].max() - v[:, 1].min()) * 0.015
         bottom_mask = v[:, 1] <= y_threshold
+        # Vỏ rỗng có hai lớp đáy rất gần nhau (đo được 0.195% chiều cao, trong khi dải
+        # 1.5% rộng gấp 7.6 lần). Ép cả hai về y=0 làm chúng trùng khít -> z-fighting.
+        # Chỉ ép lớp đáy NGOÀI: bỏ qua đỉnh nào có mặt kề hướng lên.
+        max_ny = np.full(len(v), -2.0, dtype=np.float32)
+        face_ny = m.face_normals[:, 1]
+        for k in range(3):
+            np.maximum.at(max_ny, m.faces[:, k], face_ny)
+        bottom_mask &= (max_ny <= 0.5)
         if bottom_mask.sum() > 0:
             v[bottom_mask, 1] = 0.0
 
@@ -148,17 +157,24 @@ def add_statue_pedestal(
     base_radius = max(rad_x, rad_z) * (1.0 + margin_ratio)
     base_radius = max(base_radius, 0.25)
 
+    # trimesh.creation.cylinder dựng hình trụ theo trục Z, trong khi tượng là Y-up,
+    # nên phải xoay 90° quanh X thì đế mới nằm ngang trên mặt phẳng.
+    lay_flat = trimesh.transformations.rotation_matrix(np.pi / 2.0, [1, 0, 0])
+
     if shape in ("round", "disc"):
         pedestal = trimesh.creation.cylinder(
             radius=base_radius,
             height=pedestal_height,
-            sections=48
+            sections=48,
+            transform=lay_flat
         )
         pedestal.apply_translation([0, -pedestal_height / 2.0, 0])
     elif shape == "chamfered":
-        p1 = trimesh.creation.cylinder(radius=base_radius * 1.08, height=pedestal_height * 0.5, sections=48)
+        p1 = trimesh.creation.cylinder(radius=base_radius * 1.08, height=pedestal_height * 0.5,
+                                       sections=48, transform=lay_flat)
         p1.apply_translation([0, -pedestal_height * 0.75, 0])
-        p2 = trimesh.creation.cylinder(radius=base_radius, height=pedestal_height * 0.5, sections=48)
+        p2 = trimesh.creation.cylinder(radius=base_radius, height=pedestal_height * 0.5,
+                                       sections=48, transform=lay_flat)
         p2.apply_translation([0, -pedestal_height * 0.25, 0])
         pedestal = trimesh.util.concatenate([p1, p2])
     else:
@@ -333,6 +349,64 @@ def segment_statue_parts(
         "num_parts_detected": len(part_info)
     }
 
+def optimize_material_textures(
+    mesh: trimesh.Trimesh,
+    max_texture_dim: int = 2048,
+    jpeg_quality: int = 92
+) -> trimesh.Trimesh:
+    """
+    Thu nhỏ mọi texture của vật liệu về tối đa `max_texture_dim` và mã hoá lại sang JPEG.
+
+    Phải là JPEG chứ không phải WebP: trimesh chỉ ghi được WebP qua phần mở rộng
+    EXT_texture_webp và nó nằm trong `extensionsRequired`, nên các viewer phổ thông
+    (macOS Preview/Quick Look, Windows 3D Viewer...) bỏ luôn texture — model hiện ra
+    đen bóng vì metallicFactor = 1.0. Định dạng nào khác JPEG thì trimesh ghi ra PNG,
+    nặng gấp ~5 lần. WebP mà trimesh ghi cũng chỉ là lossy quality 80 nên không mất chất.
+    """
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    if mat is None:
+        return mesh
+
+    opaque = str(getattr(mat, "alphaMode", None) or "OPAQUE").upper() == "OPAQUE"
+    for slot in ("baseColorTexture", "metallicRoughnessTexture", "emissiveTexture", "normalTexture"):
+        img = getattr(mat, slot, None)
+        if not isinstance(img, Image.Image):
+            continue
+
+        if max(img.size) > max_texture_dim:
+            scale = max_texture_dim / max(img.size)
+            img = img.resize((int(img.size[0] * scale), int(img.size[1] * scale)), Image.Resampling.LANCZOS)
+
+        # Kênh alpha ở đây chỉ là vùng đệm giữa các mảnh UV atlas; alphaMode OPAQUE
+        # nghĩa là renderer bỏ qua nó, nên khử được để dùng JPEG.
+        if img.mode == "RGBA" and opaque:
+            img = img.convert("RGB")
+
+        if img.mode == "RGB":
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=jpeg_quality, subsampling=0)
+            buf.seek(0)
+            img = Image.open(buf)
+            img.load()
+
+        setattr(mat, slot, img)
+
+    # Tượng để tô màu thì không nên là vật liệu kim loại: khi model đi qua chuỗi
+    # chuyển đổi USDZ của macOS (Preview/Quick Look), metallicRoughnessTexture hay
+    # bị rớt và metallic mặc định về 1.0 toàn khối -> tượng hiện xám kim loại, mất
+    # hết màu khuếch tán từ baseColorTexture. Đo roughness trung bình từ map (kênh
+    # G) rồi bỏ hẳn map, chuyển sang hệ số vô hướng để MỌI viewer (three.js,
+    # Blender, USDZ, Windows 3D Viewer) render giống nhau, đồng thời giảm dung lượng.
+    mr_img = getattr(mat, "metallicRoughnessTexture", None)
+    if isinstance(mr_img, Image.Image):
+        # Giá trị thật nằm trong kênh G của map; đo trước khi bỏ map đi.
+        mat.roughnessFactor = float(np.asarray(mr_img.convert("RGB"))[..., 1].mean() / 255.0)
+        mat.metallicRoughnessTexture = None
+    mat.metallicFactor = 0.0
+
+    return mesh
+
+
 def extract_and_optimize_outer_shell(
     mesh: trimesh.Trimesh,
     max_texture_dim: int = 2048
@@ -395,24 +469,73 @@ def extract_and_optimize_outer_shell(
     trimesh.repair.fix_normals(m)
     _ = m.vertex_normals
 
-    # 2. Optimize texture map (downscale from 4K to 2K, compress)
-    if hasattr(m, "visual") and hasattr(m.visual, "material") and m.visual.material:
-        mat = m.visual.material
-        img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
-        if img is not None and isinstance(img, Image.Image):
-            orig_w, orig_h = img.size
-            if max(orig_w, orig_h) > max_texture_dim:
-                scale = max_texture_dim / max(orig_w, orig_h)
-                new_size = (int(orig_w * scale), int(orig_h * scale))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
-            if img.mode == "RGBA":
-                extrema = img.getextrema()
-                if len(extrema) == 4 and extrema[3][0] == 255 and extrema[3][1] == 255:
-                    img = img.convert("RGB")
-            mat.image = img
-        mat.baseColorTexture = img
+    # 2. Optimize texture maps (downscale + re-encode)
+    optimize_material_textures(m, max_texture_dim=max_texture_dim)
 
     return m
+
+
+def _bake_uv_from_source(
+    dec_mesh: trimesh.Trimesh,
+    source: trimesh.Trimesh,
+    source_uv: np.ndarray,
+    max_texture_dim: int = 1536
+) -> trimesh.Trimesh:
+    """
+    Gán lại UV cho mesh đã rút gọn bằng cách chiếu ngược lên mesh nguồn:
+    mỗi mặt lấy UV từ đúng MỘT tam giác nguồn (tam giác gần tâm mặt nhất) rồi nội suy
+    barycentric không kẹp cho cả 3 đỉnh, nên không có mặt nào vắt qua hai mảnh UV rời nhau.
+    """
+    corners = dec_mesh.triangles
+    _, _, src_id = trimesh.proximity.closest_point(source, corners.mean(axis=1))
+    src_tri = np.repeat(source.triangles[src_id], 3, axis=0)
+    pts = corners.reshape(-1, 3)
+
+    a = src_tri[:, 0]
+    e0, e1, dv = src_tri[:, 1] - a, src_tri[:, 2] - a, pts - a
+    d00 = (e0 * e0).sum(1); d01 = (e0 * e1).sum(1); d11 = (e1 * e1).sum(1)
+    d20 = (dv * e0).sum(1); d21 = (dv * e1).sum(1)
+    den = d00 * d11 - d01 * d01
+    den = np.where(np.abs(den) < 1e-20, 1e-20, den)
+    v = (d11 * d20 - d01 * d21) / den
+    w = (d00 * d21 - d01 * d20) / den
+    bary = np.stack([1.0 - v - w, v, w], axis=1)
+    uv = (np.repeat(source_uv[source.faces[src_id]], 3, axis=0) * bary[:, :, None]).sum(axis=1)
+
+    # Hàn góc thành đỉnh theo DUNG SAI UV thật thay vì làm tròn theo lưới:
+    # làm tròn bỏ sót cặp sát nhau nhưng rơi khác bin, nên phình 22.438 -> 61.214 đỉnh.
+    # Gom các góc quanh cùng một đỉnh khi UV cách nhau <= uv_tol; đỉnh chỉ tách khi
+    # thật sự vắt qua ranh giới hai mảnh atlas.
+    uv_tol = 0.5 / float(max_texture_dim)   # 0,5 pixel -> dưới 1 texel, không thể nhìn thấy
+    corner_vert = dec_mesh.faces.reshape(-1)
+    order = np.argsort(corner_vert, kind="stable")
+    cv = corner_vert[order]
+    bounds = np.flatnonzero(np.r_[True, cv[1:] != cv[:-1], True])
+    label = np.empty(len(order), dtype=np.int64)
+    n_out = 0
+    for i in range(len(bounds) - 1):
+        idx = order[bounds[i]:bounds[i + 1]]
+        reps = []
+        for j in idx:
+            u = uv[j]
+            hit = -1
+            for k, r in enumerate(reps):
+                if abs(u[0] - r[0]) <= uv_tol and abs(u[1] - r[1]) <= uv_tol:
+                    hit = k
+                    break
+            if hit < 0:
+                reps.append(u)
+                hit = len(reps) - 1
+            label[j] = n_out + hit
+        n_out += len(reps)
+
+    cnt = np.bincount(label, minlength=n_out).astype(np.float64)[:, None]
+    vuv = np.zeros((n_out, 2)); np.add.at(vuv, label, uv);  vuv /= cnt
+    vpos = np.zeros((n_out, 3)); np.add.at(vpos, label, pts); vpos /= cnt
+
+    baked = trimesh.Trimesh(vertices=vpos, faces=label.reshape(-1, 3), process=False)
+    baked.visual = trimesh.visual.TextureVisuals(uv=vuv, material=source.visual.material)
+    return baked
 
 
 def create_max_optimized_shell(
@@ -424,7 +547,7 @@ def create_max_optimized_shell(
     Creates the ultimate lightweight, maximum-optimized outer shell model:
     1. Bóc sạch 100% ruột và các khoang ẩn bằng culling_engine (FaceParsing clearance culling).
     2. Rút gọn số lượng mặt (Polygon decimation) từ ~280k xuống ~45k mặt bằng fast_simplification.
-    3. Bảo toàn nguyên vẹn 100% Texture gốc AI và bản đồ tọa độ UV (UV mapping transfer).
+    3. Chiếu ngược UV từ mesh nguồn để giữ nguyên Texture gốc AI sau khi rút gọn.
     4. Tối ưu kích thước texture sang chuẩn 1.5K sắc nét và khử kênh Alpha dư thừa.
     5. Xuất định dạng GLB WebP siêu nhẹ (~3 - 4 MB) tải tức thì trên Mobile và Web.
     """
@@ -436,31 +559,27 @@ def create_max_optimized_shell(
 
     try:
         import fast_simplification
-        pts = np.ascontiguousarray(shell.vertices, dtype=np.float32)
-        tris = np.ascontiguousarray(shell.faces, dtype=np.int64)
 
-        v_out, f_out, collapses = fast_simplification.simplify(
-            pts, tris,
+        # Hàn các đỉnh trùng vị trí TRƯỚC khi rút gọn: mesh do AI sinh ra bị tách đỉnh tại
+        # đường khâu UV (~2.2 đỉnh / vị trí), rút gọn thẳng sẽ xé rách bề mặt (mất ~39%
+        # diện tích) và kéo theo texture bị bệt.
+        welded = shell.copy()
+        welded.merge_vertices(merge_tex=True, merge_norm=True)
+
+        v_dec, f_dec = fast_simplification.simplify(
+            np.ascontiguousarray(welded.vertices, dtype=np.float32),
+            np.ascontiguousarray(welded.faces, dtype=np.int64),
             target_count=target_faces,
-            agg=5.0,
-            return_collapses=True
+            agg=5.0
         )
-        v_dec, f_dec, mapping = fast_simplification.replay_simplification(pts, tris, collapses)
+        dec_mesh = trimesh.Trimesh(vertices=v_dec, faces=f_dec, process=False)
 
-        # Transfer UV coordinates
-        if hasattr(shell, "visual") and hasattr(shell.visual, "uv") and shell.visual.uv is not None:
-            orig_uv = np.asarray(shell.visual.uv, dtype=np.float32)
-            dec_uv = np.zeros((len(v_dec), 2), dtype=np.float32)
-            for old_idx, new_idx in enumerate(mapping):
-                if new_idx >= 0 and old_idx < len(orig_uv):
-                    dec_uv[new_idx] = orig_uv[old_idx]
-
-            dec_mesh = trimesh.Trimesh(vertices=v_dec, faces=f_dec, process=False)
-            dec_mesh.visual = trimesh.visual.TextureVisuals(uv=dec_uv, material=shell.visual.material)
-        else:
-            dec_mesh = trimesh.Trimesh(vertices=v_dec, faces=f_dec, process=False)
-            if hasattr(shell, "visual"):
-                dec_mesh.visual = shell.visual.copy()
+        # Lấy lại UV từ mesh nguồn (hàn đỉnh đã làm mất UV gốc)
+        orig_uv = getattr(getattr(shell, "visual", None), "uv", None)
+        if orig_uv is not None and len(orig_uv) == len(shell.vertices):
+            dec_mesh = _bake_uv_from_source(dec_mesh, shell, np.asarray(orig_uv, dtype=np.float64), max_texture_dim=max_texture_dim)
+        elif hasattr(shell, "visual"):
+            dec_mesh.visual = shell.visual.copy()
 
         trimesh.repair.fix_normals(dec_mesh)
         _ = dec_mesh.vertex_normals
@@ -469,6 +588,19 @@ def create_max_optimized_shell(
     except Exception as e:
         print(f"[StatueOptimizer] Max-optimized shell decimation fallback ({e})")
         return shell
+
+
+def _strip_dead_uv(mesh):
+    """Bỏ UV khi material không lấy màu từ texture map nào — UV chỉ là dữ liệu chết."""
+    mat = getattr(mesh.visual, "material", None)
+    if mat is None or getattr(mesh.visual, "uv", None) is None:
+        return mesh
+    if any(getattr(mat, a, None) is not None for a in
+           ("baseColorTexture", "emissiveTexture", "metallicRoughnessTexture",
+            "normalTexture", "occlusionTexture")):
+        return mesh
+    mesh.visual = trimesh.visual.TextureVisuals(uv=None, material=mat)
+    return mesh
 
 
 def export_all_statue_variants(
@@ -507,6 +639,7 @@ def export_all_statue_variants(
         metallicFactor=0.02
     )
     plaster_mesh.visual.material = plaster_mat
+    plaster_mesh = _strip_dead_uv(plaster_mesh)
     plaster_glb_path = output_dir / f"{stem}_plaster.glb"
     plaster_scene = trimesh.Scene({"Statue_Plaster": plaster_mesh})
     plaster_glb_bytes = trimesh.exchange.gltf.export_glb(plaster_scene, include_normals=True)
@@ -533,6 +666,7 @@ def export_all_statue_variants(
                 metallicFactor=0.05
             )
             s_mesh.visual.material = part_mat
+            s_mesh = _strip_dead_uv(s_mesh)
             scene_parts[sub_name] = s_mesh
 
     if scene_parts:
@@ -561,9 +695,10 @@ def export_all_statue_variants(
     if original_texture_mesh is not None:
         original_texture_mesh.fix_normals()
         _ = original_texture_mesh.vertex_normals
+        optimize_material_textures(original_texture_mesh, max_texture_dim=4096)
         textured_glb_path = output_dir / f"{stem}_textured.glb"
         tex_scene = trimesh.Scene({"Statue_Textured": original_texture_mesh})
-        tex_glb_bytes = trimesh.exchange.gltf.export_glb(tex_scene, include_normals=True, extension_webp=True)
+        tex_glb_bytes = trimesh.exchange.gltf.export_glb(tex_scene, include_normals=True)
         with open(textured_glb_path, "wb") as fp:
             fp.write(tex_glb_bytes)
         exported_files["textured_glb"] = str(textured_glb_path)
@@ -572,7 +707,7 @@ def export_all_statue_variants(
         shell_mesh = extract_and_optimize_outer_shell(original_texture_mesh, max_texture_dim=2048)
         shell_glb_path = output_dir / f"{stem}_shell.glb"
         shell_scene = trimesh.Scene({"Statue_Outer_Shell": shell_mesh})
-        shell_glb_bytes = trimesh.exchange.gltf.export_glb(shell_scene, include_normals=True, extension_webp=True)
+        shell_glb_bytes = trimesh.exchange.gltf.export_glb(shell_scene, include_normals=True)
         with open(shell_glb_path, "wb") as fp:
             fp.write(shell_glb_bytes)
         exported_files["shell_glb"] = str(shell_glb_path)
@@ -581,7 +716,7 @@ def export_all_statue_variants(
         shell_opt_mesh = create_max_optimized_shell(original_texture_mesh, target_faces=45000, max_texture_dim=1536)
         shell_opt_glb_path = output_dir / f"{stem}_shell_optimized.glb"
         shell_opt_scene = trimesh.Scene({"Statue_Shell_Max_Optimized": shell_opt_mesh})
-        shell_opt_glb_bytes = trimesh.exchange.gltf.export_glb(shell_opt_scene, include_normals=True, extension_webp=True)
+        shell_opt_glb_bytes = trimesh.exchange.gltf.export_glb(shell_opt_scene, include_normals=True)
         with open(shell_opt_glb_path, "wb") as fp:
             fp.write(shell_opt_glb_bytes)
         exported_files["shell_optimized_glb"] = str(shell_opt_glb_path)

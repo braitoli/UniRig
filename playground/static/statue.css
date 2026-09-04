@@ -613,6 +613,35 @@ body {
     color: var(--text-secondary);
 }
 
+.brightness-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 10px;
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 12px;
+    margin-right: 6px;
+}
+
+.brightness-control input[type="range"] {
+    width: 90px;
+    accent-color: var(--primary);
+    cursor: pointer;
+}
+
+.brightness-value {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    min-width: 32px;
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+}
+
 .view-modes {
     display: flex;
     gap: 4px;
@@ -721,118 +750,6 @@ body {
     border-color: #38bdf8 !important;
     box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
     transform: translateX(4px);
-}
-
-/* Interactive Painting Toolbar */
-.painting-bar {
-    background-color: rgba(19, 23, 34, 0.95);
-    backdrop-filter: blur(12px);
-    border-top: 1px solid var(--border-color);
-    padding: 10px 16px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    z-index: 10;
-}
-
-.paint-tools {
-    display: flex;
-    gap: 6px;
-}
-
-.paint-tool-btn {
-    background-color: var(--bg-card);
-    border: 1px solid var(--border-color);
-    color: var(--text-secondary);
-    padding: 6px 12px;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-}
-
-.paint-tool-btn.active {
-    background-color: var(--primary);
-    color: #fff;
-    border-color: var(--primary);
-}
-
-.paint-tool-btn.btn-danger-soft:hover {
-    background-color: var(--accent);
-    color: #fff;
-}
-
-.paint-palette {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 1;
-    overflow-x: auto;
-}
-
-.palette-title {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-secondary);
-    white-space: nowrap;
-}
-
-.palette-colors {
-    display: flex;
-    gap: 5px;
-}
-
-.color-swatch {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    cursor: pointer;
-    border: 2px solid transparent;
-    transition: transform 0.15s;
-}
-
-.color-swatch:hover {
-    transform: scale(1.2);
-}
-
-.color-swatch.active {
-    border-color: #fff;
-    box-shadow: 0 0 8px rgba(255,255,255,0.6);
-    transform: scale(1.15);
-}
-
-.custom-color-picker input[type="color"] {
-    display: none;
-}
-
-.custom-color-picker label {
-    width: 24px;
-    height: 24px;
-    background-color: var(--bg-card);
-    border: 1px solid var(--border-color);
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    font-size: 11px;
-}
-
-.material-finish {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    white-space: nowrap;
-}
-
-.finish-title {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-secondary);
 }
 
 .form-select-sm {
@@ -968,6 +885,58 @@ body {
 .dl-arrow {
     font-size: 12px;
     color: var(--text-muted);
+}
+
+.dl-preview-panel {
+    position: fixed;
+    width: 300px;
+    background: rgba(19, 23, 34, 0.98);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.7);
+    padding: 14px;
+    z-index: 2000;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dl-preview-thumb {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.dl-preview-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.dl-preview-loading {
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 0 12px;
+}
+
+.dl-preview-name {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.dl-preview-size {
+    font-size: 11px;
+    color: var(--text-secondary);
 }
 
 .code-snippet {

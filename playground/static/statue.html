@@ -113,6 +113,15 @@
                                     <span class="radio-card-desc">Tối ưu phong cách hoạt hình, chi tiết đa góc nhìn</span>
                                 </div>
                             </label>
+                            <label class="radio-card">
+                                <input type="radio" name="generator" value="pixal3d">
+                                <div class="radio-card-content">
+                                    <div class="radio-card-title">
+                                        <i class="fa-solid fa-camera-rotate"></i> Pixal3D (SIGGRAPH 2026)
+                                    </div>
+                                    <span class="radio-card-desc">Bám sát pixel ảnh gốc, hỗ trợ nạp nhiều góc nhìn 360°</span>
+                                </div>
+                            </label>
                         </div>
                     </div>
 
@@ -132,19 +141,19 @@
                             <label class="form-label">Tối ưu số mặt (Decimation):</label>
                             <select class="form-select" id="target-faces-select">
                                 <option value="25000">25,000 Faces (Tối ưu Mobile / Web nhẹ)</option>
-                                <option value="50000" selected>50,000 Faces (Chuẩn WebGL 60FPS)</option>
+                                <option value="50000">50,000 Faces (Chuẩn WebGL 60FPS)</option>
                                 <option value="100000">100,000 Faces (Chi tiết cao)</option>
-                                <option value="0">Nguyên bản (Không giảm mặt)</option>
+                                <option value="0" selected>Nguyên bản (Không giảm mặt)</option>
                             </select>
                         </div>
 
                         <div class="form-row">
                             <label class="form-label">Đế tượng đứng vững (Pedestal):</label>
                             <select class="form-select" id="pedestal-shape-select">
+                                <option value="none">Không Có Đế (Để tượng phẳng đáy)</option>
                                 <option value="round" selected>Đế Tròn Thạch Cao (Khuyên dùng)</option>
                                 <option value="square">Đế Vuông Sang Trọng</option>
                                 <option value="chamfered">Đế Vát Đa Tầng</option>
-                                <option value="none">Phẳng Đáy Tự Nhiên (Không thêm đế)</option>
                             </select>
                         </div>
 
@@ -155,14 +164,6 @@
                                 <option value="horizontal">🚗 Nằm Ngang (Xe cộ / Thú 4 chân)</option>
                                 <option value="upright">🧍 Đứng Thẳng (Nhân vật / Người)</option>
                             </select>
-                        </div>
-
-                        <div class="form-row checkbox-row">
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="enable-rigging-checkbox">
-                                <span class="checkmark"></span>
-                                <span class="checkbox-label">Tích hợp khung xương & Hoạt ảnh nhảy múa</span>
-                            </label>
                         </div>
                     </div>
 
@@ -209,9 +210,8 @@
                         </div>
                         <span class="toolbar-title" id="view-mode-label"><i class="fa-solid fa-eye"></i> Chế độ xem:</span>
                         <div class="view-modes" id="view-modes-container">
-                            <button class="mode-btn active" data-mode="painted" title="Tô màu thử nghiệm trực tiếp"><i class="fa-solid fa-palette"></i> Đang Tô Màu</button>
                             <button class="mode-btn" data-mode="plaster" title="Tượng thạch cao trắng nguyên bản"><i class="fa-solid fa-monument"></i> Thạch Cao Trắng</button>
-                            <button class="mode-btn" data-mode="segmented" title="Xem các phân vùng bộ phận để đổ màu"><i class="fa-solid fa-puzzle-piece"></i> Phân Vùng Đổ Màu</button>
+                            <button class="mode-btn active" data-mode="segmented" title="Xem các phân vùng bộ phận"><i class="fa-solid fa-puzzle-piece"></i> Phân Vùng Đổ Màu</button>
                             <button class="mode-btn" data-mode="textured" title="Texture gốc từ ảnh AI"><i class="fa-solid fa-image"></i> Texture AI Gốc</button>
                             <button class="mode-btn" data-mode="wireframe" title="Xem lưới tam giác"><i class="fa-solid fa-border-all"></i> Khung Lưới</button>
                         </div>
@@ -253,6 +253,13 @@
                             </div>
                         </div>
 
+                        <div class="brightness-control" id="brightness-control" title="Chỉnh độ sáng khung nhìn 3D (không đổi vật liệu model)">
+                            <i class="fa-solid fa-sun"></i>
+                            <span class="toolbar-title">Độ sáng</span>
+                            <input type="range" id="brightness-slider" min="0.4" max="2.5" step="0.05" value="1">
+                            <span class="brightness-value" id="brightness-value">1.0x</span>
+                        </div>
+
                         <div class="preview-controls-group" id="preview-controls-group" style="display:flex; gap:6px;">
                             <button class="btn-icon" id="btn-reset-camera" title="Căn giữa góc nhìn"><i class="fa-solid fa-compress"></i></button>
                             <button class="btn-icon" id="btn-toggle-grid" title="Bật/tắt mặt sàn"><i class="fa-solid fa-table-cells"></i></button>
@@ -283,46 +290,6 @@
                 <!-- Embedded 3DPainting Studio Engine -->
                 <div class="iframe-3dpainting-container" id="iframe-3dpainting-container" style="display:none; flex:1; width:100%; height:100%; position:relative; min-height:480px;">
                     <iframe id="iframe-3dpainting" src="" style="width:100%; height:100%; border:none;" allow="accelerometer; camera; gyroscope"></iframe>
-                </div>
-
-                <!-- Interactive Painting Studio Bar -->
-                <div class="painting-bar" id="painting-bar">
-                    <div class="paint-tools">
-                        <button class="paint-tool-btn active" id="tool-bucket" title="Đổ màu toàn bộ phân vùng được click">
-                            <i class="fa-solid fa-fill-drip"></i> Đổ Màu Phân Vùng
-                        </button>
-                        <button class="paint-tool-btn" id="tool-brush" title="Vẽ cọ tự do lên bề mặt tượng">
-                            <i class="fa-solid fa-paintbrush"></i> Cọ Vẽ Bề Mặt
-                        </button>
-                        <button class="paint-tool-btn" id="tool-eraser" title="Tẩy / Đưa phần được click về thạch cao trắng">
-                            <i class="fa-solid fa-eraser"></i> Tẩy Về Trắng
-                        </button>
-                        <button class="paint-tool-btn btn-danger-soft" id="btn-reset-paint" title="Xóa toàn bộ màu đã tô">
-                            <i class="fa-solid fa-rotate-left"></i> Làm Mới Tượng
-                        </button>
-                    </div>
-
-                    <div class="paint-palette">
-                        <span class="palette-title">Bảng Màu Gốm Sứ:</span>
-                        <div class="palette-colors" id="palette-colors">
-                            <!-- Populated dynamically with 24 colors -->
-                        </div>
-                        <div class="custom-color-picker">
-                            <input type="color" id="custom-color-input" value="#FF5722">
-                            <label for="custom-color-input" title="Tự chọn màu tùy ý"><i class="fa-solid fa-eye-dropper"></i></label>
-                        </div>
-                    </div>
-
-                    <!-- Material Finish Preset Selector -->
-                    <div class="material-finish">
-                        <span class="finish-title">Chất Liệu Men:</span>
-                        <select class="form-select-sm" id="material-finish-select">
-                            <option value="plaster">Thạch Cao Mờ (Gypsum Matte)</option>
-                            <option value="ceramic_glossy" selected>Gốm Sứ Tráng Men (Glossy Glaze)</option>
-                            <option value="clay">Đất Sét Nung (Terracotta)</option>
-                            <option value="metallic_gold">Mạ Vàng Kim (Gold Leaf)</option>
-                        </select>
-                    </div>
                 </div>
 
                 <!-- Animation Player Bar (shown when rigged model is loaded) -->
@@ -397,15 +364,6 @@
                                 <i class="fa-solid fa-download dl-arrow"></i>
                             </a>
 
-                            <a href="#" class="btn-download" id="dl-painted" download="statue_painted.glb">
-                                <div class="dl-icon"><i class="fa-solid fa-palette"></i></div>
-                                <div class="dl-info">
-                                    <span class="dl-title">Tượng Đã Tô Màu Trực Tiếp</span>
-                                    <span class="dl-desc">Xuất kết quả bạn vừa tô thử trên Studio</span>
-                                </div>
-                                <i class="fa-solid fa-download dl-arrow"></i>
-                            </a>
-
                             <a href="#" class="btn-download" id="dl-textured" target="_blank">
                                 <div class="dl-icon"><i class="fa-solid fa-image"></i></div>
                                 <div class="dl-info">
@@ -443,6 +401,16 @@
                                 <i class="fa-solid fa-download dl-arrow"></i>
                             </a>
                         </div>
+                    </div>
+
+                    <!-- Panel xem trước 3D khi hover vào một nút tải về GLB -->
+                    <div class="dl-preview-panel" id="dl-preview-panel" style="display:none;">
+                        <div class="dl-preview-thumb">
+                            <img id="dl-preview-img" class="dl-preview-img" alt="Xem trước 3D" style="display:none;">
+                            <div class="dl-preview-loading" id="dl-preview-loading">Đang dựng xem trước...</div>
+                        </div>
+                        <div class="dl-preview-name" id="dl-preview-name"></div>
+                        <div class="dl-preview-size" id="dl-preview-size"></div>
                     </div>
 
                     <!-- Developer Integration Guide -->
