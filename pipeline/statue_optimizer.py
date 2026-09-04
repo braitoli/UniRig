@@ -23,17 +23,25 @@ from typing import Dict, List, Optional, Tuple, Any
 from PIL import Image
 from io import BytesIO
 
+# Nhãn trung tính, đánh số. Thuật toán chia vùng chỉ cắt theo dải chiều cao và bán kính
+# nên nhãn giải phẫu người ("Tóc / Mũ", "Tay / Cánh tay") sai với phần lớn đầu vào thực tế
+# (khủng long, linh thú, xe hơi). Tên đánh số không hứa hẹn điều gì mà thuật toán không làm được.
+#
+# Thứ tự và màu GIỮ NGUYÊN: chỉ mục là id vùng (`STATUE_PALETTE[pid % len(...)]`), nên
+# xoá mục nào cũng làm lệch id — bỏ mục 6 sẽ đẩy đế tượng từ xám #90A4AE sang đỏ #E57373.
+# Mục 6, 8, 9 hiện không được gán (logic chỉ sinh id 0,1,2,3,4,5,7) nên để dành, đặt tên
+# rõ là dự phòng để không lẫn với 7 vùng người dùng thực sự nhìn thấy.
 STATUE_PALETTE = [
-    {"name": "Đầu / Khuôn mặt (Head)", "hex": "#FFE0BD", "rgb": [255, 224, 189]},
-    {"name": "Tóc / Mũ (Hair/Headwear)", "hex": "#795548", "rgb": [121, 85, 72]},
-    {"name": "Thân trên / Áo (Upper Body)", "hex": "#4FC3F7", "rgb": [79, 195, 247]},
-    {"name": "Thân dưới / Quần (Lower Body)", "hex": "#81C784", "rgb": [129, 199, 132]},
-    {"name": "Tay / Cánh tay (Arms/Hands)", "hex": "#FFB74D", "rgb": [255, 183, 77]},
-    {"name": "Chân / Giày (Legs/Feet)", "hex": "#BA68C8", "rgb": [186, 104, 200]},
-    {"name": "Phụ kiện / Trang sức (Accessories)", "hex": "#FFD54F", "rgb": [255, 213, 79]},
-    {"name": "Đế tượng (Pedestal Base)", "hex": "#90A4AE", "rgb": [144, 164, 174]},
-    {"name": "Chi tiết nhỏ (Fine Accents)", "hex": "#E57373", "rgb": [229, 115, 115]},
-    {"name": "Màu xanh ngọc (Cyan Pearl)", "hex": "#4DD0E1", "rgb": [77, 208, 225]},
+    {"name": "Vùng 1", "hex": "#FFE0BD", "rgb": [255, 224, 189]},
+    {"name": "Vùng 2", "hex": "#795548", "rgb": [121, 85, 72]},
+    {"name": "Vùng 3", "hex": "#4FC3F7", "rgb": [79, 195, 247]},
+    {"name": "Vùng 4", "hex": "#81C784", "rgb": [129, 199, 132]},
+    {"name": "Vùng 5", "hex": "#FFB74D", "rgb": [255, 183, 77]},
+    {"name": "Vùng 6", "hex": "#BA68C8", "rgb": [186, 104, 200]},
+    {"name": "Vùng dự phòng A", "hex": "#FFD54F", "rgb": [255, 213, 79]},
+    {"name": "Vùng 7", "hex": "#90A4AE", "rgb": [144, 164, 174]},
+    {"name": "Vùng dự phòng B", "hex": "#E57373", "rgb": [229, 115, 115]},
+    {"name": "Vùng dự phòng C", "hex": "#4DD0E1", "rgb": [77, 208, 225]},
 ]
 
 def clean_and_repair_mesh(mesh: trimesh.Trimesh, cull_hidden: bool = True) -> trimesh.Trimesh:
@@ -316,7 +324,12 @@ def segment_statue_parts(
 
         try:
             subm = mesh.submesh([p_faces_mask], append=True)
-            subm_name = f"Part_{pid:02d}_{p_name.split(' ')[0]}"
+            # Dùng thẳng nhãn làm tên node GLB. Mẫu cũ `Part_NN_{từ đầu tiên}` với nhãn
+            # đánh số sẽ ra `Part_00_Vùng`, `Part_01_Vùng`... trùng phần đọc được.
+            # Tên node còn là chuỗi hiện trên tooltip khi rê chuột (statue.js:282) và là
+            # khoá đối chiếu với danh sách phân vùng (statue.js:311, so bằng `includes`),
+            # nên đặt bằng đúng nhãn thì hai chỗ đó khớp nhau.
+            subm_name = p_name
             submeshes[subm_name] = subm
 
             part_info.append({
