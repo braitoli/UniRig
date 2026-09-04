@@ -351,6 +351,13 @@ function getPBRMaterialForColor(hexColor, finishType) {
     });
 }
 
+// Đếm tăng dần mỗi lần load3DStatueModel được gọi — dùng để chặn "ping-pong nạp file":
+// nếu người dùng bấm nhanh giữa 2 chế độ tự nạp file khác nhau (textured/segmented),
+// có thể có 2 request GLTFLoader.load() cùng bay trên mạng; request cũ có thể hoàn tất
+// SAU request mới hơn và ghi đè currentModel/state bằng dữ liệu đã lỗi thời. Mỗi lần gọi
+// hàm này giữ lại "vé" (token) riêng, callback chỉ được áp dụng nếu vé đó vẫn là vé mới nhất.
+let loadRequestSeq = 0;
+
 function load3DStatueModel(glbUrl, mode = 'segmented', statueName = '', fallbackUrl = null, fallbackMode = null) {
     showCanvasLoader('Đang tải tượng 3D...');
     state.currentGlbUrl = glbUrl;
@@ -360,11 +367,23 @@ function load3DStatueModel(glbUrl, mode = 'segmented', statueName = '', fallback
     }
     syncModelTo3DPaintingIframe();
 
+    const myLoadSeq = ++loadRequestSeq;
     const loader = new THREE.GLTFLoader();
     loader.load(glbUrl, (gltf) => {
+        if (myLoadSeq !== loadRequestSeq) {
+            // Đã có 1 lệnh nạp MỚI HƠN bắt đầu sau lệnh này — bỏ kết quả đã lỗi thời,
+            // không ghi đè currentModel/state bằng dữ liệu cũ.
+            console.warn(`[load3DStatueModel] Bỏ qua kết quả nạp đã lỗi thời cho ${glbUrl} (đã có yêu cầu nạp mới hơn)`);
+            return;
+        }
+
         if (currentModel) {
             scene.remove(currentModel);
         }
+        // Dọn đường viền ranh giới của model CŨ ngay khi thay model, bất kể mode sắp vào là
+        // gì — tránh rò rỉ object nếu người dùng rời mode 'segmented' rồi nạp model khác mà
+        // không quay lại 'segmented' lần nào để tự dọn qua ensureBoundaryLines().
+        disposeBoundaryLines();
 
         currentModel = gltf.scene;
         state.originalMaterialsMap.clear();
@@ -422,11 +441,13 @@ function load3DStatueModel(glbUrl, mode = 'segmented', statueName = '', fallback
             hideCanvasLoader();
         }
     }, (progress) => {
+        if (myLoadSeq !== loadRequestSeq) return; // lenh nap nay da lac hau, bo qua tien do
         if (progress.total > 0) {
             const pct = Math.round((progress.loaded / progress.total) * 100);
             document.getElementById('canvas-loader-text').innerText = `Đang tải: ${pct}%`;
         }
     }, (error) => {
+        if (myLoadSeq !== loadRequestSeq) return; // lenh nap nay da lac hau, bo qua loi
         // Vi du: job co san textured_glb (HEAD 2xx) nhung file thuc te khong doc duoc
         // (hong, khong dung dinh dang GLB...) -> lui ve ban du phong thay vi vo trang.
         if (fallbackUrl) {
@@ -454,7 +475,12 @@ function updateViewMode(mode, reloadModel = false) {
     // rời từ textured — nhưng URL textured của job là `/files/textured_glb` (không có đuôi
     // .glb) nên điều kiện đó không bao giờ khớp, làm mode segmented bị kẹt hiện textured.
     // Bỏ điều kiện thừa đó, dùng đúng cách so sánh URL đơn giản như nhánh 'textured' đang làm.
-    if ((mode === 'segmented' || mode === 'plaster') && reloadModel) {
+    //
+    // CHỈ 'segmented' cần nạp lại — nó cần đúng 7 mesh node + vật liệu gốc của segmented_glb.
+    // 'plaster' KHÔNG cần: nó chỉ gán màu trắng phẳng, không phụ thuộc model nguồn nào, nên
+    // tô thẳng lên model đang có (giống 'wireframe' đã làm) — tránh nạp mạng thừa và giảm bề
+    // mặt có thể xảy ra đua request khi bấm nhanh qua lại textured/segmented/plaster.
+    if (mode === 'segmented' && reloadModel) {
         let segUrl = null;
         if (state.activeJobId) {
             segUrl = `/api/statue/jobs/${state.activeJobId}/files/segmented_glb`;
