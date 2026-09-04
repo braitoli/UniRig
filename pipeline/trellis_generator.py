@@ -1,6 +1,5 @@
 import os
 import time
-import torch
 import numpy as np
 import requests
 from pathlib import Path
@@ -16,63 +15,8 @@ class TrellisImageTo3DGenerator:
     def __init__(
         self,
         model_id: str = "microsoft/TRELLIS.2-4B",
-        device: str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16
     ):
         self.model_id = model_id
-        self.device = device if torch.cuda.is_available() else "cpu"
-        self.torch_dtype = torch_dtype
-        self.pipeline = None
-        self._is_loaded = False
-
-    def load_pipeline(self):
-        """Lazily load the TRELLIS.2 pipeline from Hugging Face."""
-        if self._is_loaded and self.pipeline is not None:
-            return
-
-        print(f"[TrellisGenerator] Loading {self.model_id} on {self.device}...")
-        t0 = time.time()
-        
-        try:
-            # Try importing trellis2 or trellis pipeline module if available
-            try:
-                from trellis2.pipelines import Trellis2ImageTo3DPipeline
-                self.pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
-                    self.model_id,
-                    torch_dtype=self.torch_dtype
-                )
-                self.pipeline.to(self.device)
-                self._is_loaded = True
-                print(f"[TrellisGenerator] Trellis2ImageTo3DPipeline loaded in {time.time() - t0:.2f}s")
-                return
-            except ImportError:
-                pass
-
-            try:
-                from trellis.pipelines import TrellisImageTo3DPipeline
-                self.pipeline = TrellisImageTo3DPipeline.from_pretrained(
-                    self.model_id,
-                    torch_dtype=self.torch_dtype
-                )
-                self.pipeline.to(self.device)
-                self._is_loaded = True
-                print(f"[TrellisGenerator] TrellisImageTo3DPipeline loaded in {time.time() - t0:.2f}s")
-                return
-            except ImportError:
-                pass
-
-            # Fallback: Load via HuggingFace transformers / diffusers or custom pipeline runner
-            from huggingface_hub import snapshot_download
-            repo_dir = snapshot_download(repo_id=self.model_id)
-            print(f"[TrellisGenerator] Snapshot downloaded to {repo_dir}")
-            
-            # Use diffusers/transformers or custom loader
-            self._is_loaded = True
-
-        except Exception as e:
-            print(f"[TrellisGenerator] Warning: Could not initialize native TRELLIS pipeline: {e}")
-            self.pipeline = None
-            self._is_loaded = False
 
     def preprocess_image(self, image_input: Union[str, Path, Image.Image]) -> Image.Image:
         """Loads and pre-processes input image to square RGBA/RGB format with centered subject."""
@@ -174,10 +118,26 @@ class TrellisImageTo3DGenerator:
         # theo lưới (resolution), PBR bake scale theo diện tích texture (texture_size).
         est_duration = (120.0 if str(resolution) == "512" else 240.0) \
             + 360.0 * (texture_size / 4096.0) ** 2
+        # gx10-model-serving là hàng đợi FIFO dùng chung với các dự án khác trên máy —
+        # nếu job của dự án khác chiếm hàng đợi lâu, service treo ở "running", hoặc
+        # response thiếu key "state", vòng poll không có trần thời gian sẽ chờ vô hạn và
+        # giữ luôn thread trong pool. 1800s khớp với timeout HTTP của worker cũ trước khi
+        # migrate sang gx10-model-serving (xem git show 99146ad:pipeline/trellis_generator.py).
+        poll_deadline_sec = max(1800.0, est_duration * 3)
         t_poll_start = time.time()
         job_state = None
         job_error = None
+        last_queue_position = None
         while True:
+            elapsed = time.time() - t_poll_start
+            if elapsed > poll_deadline_sec:
+                raise RuntimeError(
+                    f"gx10-model-serving job {job_id} vượt quá thời gian chờ tối đa "
+                    f"({poll_deadline_sec:.0f}s, đã chờ {elapsed:.0f}s). "
+                    f"queue_position cuối cùng thấy được: {last_queue_position!r}. "
+                    "Job có thể đang kẹt trong hàng đợi FIFO dùng chung hoặc treo ở "
+                    "trạng thái running."
+                )
             try:
                 status_resp = requests.get(f"{base_url}/v1/jobs/{job_id}", timeout=10)
                 status_resp.raise_for_status()
@@ -186,11 +146,11 @@ class TrellisImageTo3DGenerator:
                 raise RuntimeError(
                     f"Mất kết nối tới gx10-model-serving khi đang chờ job {job_id}: {e}"
                 )
+            last_queue_position = status.get("queue_position", last_queue_position)
             job_state = status.get("state")
             if job_state in ("succeeded", "failed"):
                 job_error = status.get("error")
                 break
-            elapsed = time.time() - t_poll_start
             ratio = min(1.0, elapsed / est_duration)
             cur_pct = int(25 + 50 * (1.0 - np.exp(-2.2 * ratio)))
             cur_pct = min(75, max(25, cur_pct))

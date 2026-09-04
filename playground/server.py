@@ -26,7 +26,6 @@ if str(ROOT_DIR) not in sys.path:
 from pipeline.unirig_pipeline import UniRigPipeline
 from pipeline.statue_pipeline import Statue3DPipeline
 from pipeline.statue_optimizer import STATUE_PALETTE
-from pipeline.pixal3d_generator import _trellis_worker_pids, stop_trellis_worker
 from playground import database
 from playground.automation_service import StatueAutomationService, test_webhook_endpoint
 
