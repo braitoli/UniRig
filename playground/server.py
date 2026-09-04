@@ -84,29 +84,75 @@ async def server_startup():
 
 
 def get_lan_ips() -> List[str]:
-    """Find all accessible IPv4 LAN addresses."""
-    ips = set()
+    """Find accessible host physical IPv4 LAN addresses, excluding docker/container bridges and VPN tunnels."""
+    import subprocess
+    primary_ip = None
+
+    # 1. Tìm IP của card mạng có default gateway (card vật lý chính nối mạng LAN)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ips.add(s.getsockname()[0])
-        s.close()
+        out = subprocess.check_output(["ip", "route"], text=True)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("default via"):
+                parts = line.split()
+                if "src" in parts:
+                    primary_ip = parts[parts.index("src") + 1]
+                    break
     except Exception:
         pass
 
-    import subprocess
+    # 2. Duyệt các interface mạng và lọc bỏ container / docker / VPN
+    physical_ips = []
+    virtual_prefixes = ("docker", "br-", "veth", "virbr", "lo")
+    vpn_names = ("pcrender", "tun", "tap", "wg", "tailscale", "wireguard")
+
     try:
         out = subprocess.check_output(["ip", "-4", "addr"], text=True)
+        current_iface = ""
+        is_virtual = False
+        is_vpn = False
         for line in out.splitlines():
             line = line.strip()
-            if line.startswith("inet ") and not line.startswith("inet 127."):
+            if not line:
+                continue
+            if line[0].isdigit() and ":" in line:
+                current_iface = line.split(":")[1].strip()
+                is_virtual = any(current_iface.startswith(p) for p in virtual_prefixes)
+                is_vpn = any(current_iface.startswith(p) for p in vpn_names) or "POINTOPOINT" in line
+            elif line.startswith("inet "):
                 ip = line.split()[1].split("/")[0]
-                if not ip.startswith("172."): # Skip docker bridge networks
-                    ips.add(ip)
+                if ip.startswith("127.") or ip.startswith("172."):
+                    continue
+                if is_virtual or is_vpn:
+                    continue
+                if ip not in physical_ips:
+                    physical_ips.append(ip)
     except Exception:
         pass
-        
-    return sorted(list(ips))
+
+    # Sắp xếp kết quả: ưu tiên primary_ip của host trước, tiếp theo là dải 192.168.x.x
+    res = []
+    if primary_ip and primary_ip in physical_ips:
+        res.append(primary_ip)
+        for ip in physical_ips:
+            if ip != primary_ip and ip not in res:
+                res.append(ip)
+    elif physical_ips:
+        physical_ips.sort(key=lambda x: (not x.startswith("192.168."), x))
+        res.extend(physical_ips)
+    else:
+        # Fallback socket nếu không có lệnh ip
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if not ip.startswith("127.") and not ip.startswith("172."):
+                res.append(ip)
+        except Exception:
+            pass
+
+    return res
 
 def run_job_background(job_id: str):
     """Executes the 5 pipeline stages (Stage 0 Image-to-3D if 2D image -> Stage 1..4) in background and updates DB state."""
@@ -125,11 +171,20 @@ def run_job_background(job_id: str):
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     current_3d_input = input_file
     
+    is_mv = metadata.get("input_type") == "multiview" or os.path.isdir(input_file)
     try:
-        if ext in image_exts:
-            # Stage 0: 2D Image to 3D Generation (TRELLIS.2-4B / Tencent Hunyuan3D-2.1)
+        if ext in image_exts or is_mv:
+            # Stage 0: 2D Image to 3D Generation (TRELLIS.2-4B / Tencent Hunyuan3D-2.1 / Pixal3D / Pixal3D-MV)
             generator_choice = metadata.get("generator", "trellis")
-            gen_folder = "stage0_hunyuan3d" if "hunyuan" in generator_choice.lower() else "stage0_trellis"
+            if "pixal" in generator_choice.lower() and (is_mv or "mv" in generator_choice.lower()):
+                gen_folder = "stage0_pixal3d_mv"
+                generator_choice = "pixal3d_mv"
+            elif "hunyuan" in generator_choice.lower():
+                gen_folder = "stage0_hunyuan3d"
+            elif "pixal" in generator_choice.lower():
+                gen_folder = "stage0_pixal3d"
+            else:
+                gen_folder = "stage0_trellis"
             
             def on_stage0_progress(pct: int, step_name: str, step_idx: int = 1, total_steps: int = 5):
                 metadata["progress"] = {
@@ -424,6 +479,77 @@ async def upload_custom_job(
     background_tasks.add_task(run_job_background, job_id)
     return job
 
+@app.post("/api/jobs/upload_multiview")
+async def upload_multiview_job(
+    mv_type: str = Form("turnaround"),
+    mode: str = Form("full"),
+    generator: str = Form("pixal3d_mv"),
+    mesh_detail: str = Form("high"),
+    texture_detail: str = Form("high"),
+    file_sheet: Optional[UploadFile] = File(None),
+    file_front: Optional[UploadFile] = File(None),
+    file_right: Optional[UploadFile] = File(None),
+    file_back: Optional[UploadFile] = File(None),
+    file_left: Optional[UploadFile] = File(None),
+    background_tasks: BackgroundTasks = None
+):
+    from pipeline.multiview_utils import split_turnaround_sheet, setup_multiview_from_4files
+
+    job_id = f"job_{int(time.time())}_mv_pixal3d"
+    job_dir = STORAGE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    views_dir = job_dir / "stage0_pixal3d_mv" / "mv_views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+
+    if mv_type == "turnaround":
+        if not file_sheet:
+            raise HTTPException(status_code=400, detail="Vui lòng tải lên ảnh Turnaround Sheet!")
+        sheet_path = job_dir / file_sheet.filename
+        content = await file_sheet.read()
+        with open(sheet_path, "wb") as f:
+            f.write(content)
+        
+        split_turnaround_sheet(str(sheet_path), str(views_dir))
+        input_filename = file_sheet.filename
+        title_str = f"Multi-View (Sheet): {file_sheet.filename}"
+    else:
+        # 4views mode
+        if not (file_front and file_right and file_back and file_left):
+            raise HTTPException(status_code=400, detail="Vui lòng tải lên đầy đủ 4 góc: Front (0°), Sườn phải (270°), Back (180°), Sườn trái (90°)!")
+        
+        front_p = job_dir / f"front_{file_front.filename}"
+        right_p = job_dir / f"right_{file_right.filename}"
+        back_p = job_dir / f"back_{file_back.filename}"
+        left_p = job_dir / f"left_{file_left.filename}"
+        
+        with open(front_p, "wb") as f: f.write(await file_front.read())
+        with open(right_p, "wb") as f: f.write(await file_right.read())
+        with open(back_p, "wb") as f: f.write(await file_back.read())
+        with open(left_p, "wb") as f: f.write(await file_left.read())
+        
+        setup_multiview_from_4files(str(front_p), str(right_p), str(back_p), str(left_p), str(views_dir))
+        input_filename = file_front.filename
+        title_str = f"Multi-View (4 góc): {file_front.filename}"
+
+    job = database.create_job(
+        job_id=job_id,
+        title=title_str,
+        input_filename=input_filename,
+        input_file_path=str(views_dir),
+        metadata={
+            "mode": mode,
+            "generator": "pixal3d_mv",
+            "input_type": "multiview",
+            "mv_type": mv_type,
+            "mesh_detail": mesh_detail,
+            "texture_detail": texture_detail,
+        }
+    )
+
+    background_tasks.add_task(run_job_background, job_id)
+    return job
+
+
 @app.post("/api/jobs/{job_id}/continue_rigging")
 async def continue_rigging_endpoint(
     job_id: str,
@@ -576,6 +702,38 @@ async def continue_rigging_endpoint(
             database.update_job(job_id, status="failed", error_message=str(e), metadata={"traceback": tb})
 
     background_tasks.add_task(run_continue_worker)
+    return {"status": "started", "job_id": job_id}
+
+@app.post("/api/jobs/{job_id}/rerun")
+async def rerun_job_endpoint(
+    job_id: str,
+    generator: Optional[str] = Form(None),
+    mesh_detail: Optional[str] = Form(None),
+    texture_detail: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = None
+):
+    """Re-runs full pipeline from Stage 0 (if image) or Stage 1 (if 3D) with updated generator/detail settings."""
+    job = database.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    metadata = job.get("metadata", {})
+    if generator:
+        metadata["generator"] = generator
+    if mesh_detail:
+        metadata["mesh_detail"] = mesh_detail
+    if texture_detail:
+        metadata["texture_detail"] = texture_detail
+    metadata["mode"] = "full"
+    
+    database.update_job(
+        job_id,
+        status="queued",
+        stage=0,
+        error_message=None,
+        metadata=metadata
+    )
+    background_tasks.add_task(run_job_background, job_id)
     return {"status": "started", "job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
@@ -760,21 +918,46 @@ async def get_generated_3d_glb(job_id: str):
         )
     raise HTTPException(status_code=404, detail="Generated 3D GLB file not found")
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+def resolve_input_image(job) -> Optional[Path]:
+    """
+    The 2D image a job started from.
+
+    A multi-view job records its views directory as input_file_path, not a file, so the
+    picture the user actually uploaded -- the turnaround sheet, or the front view -- has
+    to be found at the top level of the job directory instead.
+    """
+    input_p = Path(job["input_file_path"])
+    if input_p.is_file() and input_p.suffix.lower() in IMAGE_EXTS:
+        return input_p
+
+    job_dir = STORAGE_DIR / job["id"]
+    if not job_dir.is_dir():
+        return None
+    named = job_dir / (job.get("input_filename") or "")
+    candidates = [named, *sorted(job_dir.glob("front_*")), *sorted(job_dir.iterdir())]
+    for p in candidates:
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            return p
+    return None
+
+
 @app.api_route("/api/jobs/{job_id}/files/input_image", methods=["GET", "HEAD"])
 async def get_input_image(job_id: str):
     job = database.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    input_p = Path(job["input_file_path"])
-    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-    if input_p.exists() and input_p.suffix.lower() in image_exts:
-        media_type = f"image/{input_p.suffix.lower().removeprefix('.')}"
-        if media_type == "image/jpg":
-            media_type = "image/jpeg"
-        return FileResponse(str(input_p), media_type=media_type)
-        
-    raise HTTPException(status_code=404, detail="Original 2D image file not found")
+
+    input_p = resolve_input_image(job)
+    if input_p is None:
+        raise HTTPException(status_code=404, detail="Original 2D image file not found")
+
+    media_type = f"image/{input_p.suffix.lower().removeprefix('.')}"
+    if media_type == "image/jpg":
+        media_type = "image/jpeg"
+    return FileResponse(str(input_p), media_type=media_type)
 
 @app.api_route("/api/jobs/{job_id}/files/input_model", methods=["GET", "HEAD"])
 async def get_input_model(job_id: str):
@@ -1152,8 +1335,7 @@ async def get_statue_file_endpoint(job_id: str, file_type: str):
             matches = list(job_dir.glob("*_statue_package.zip"))
             if matches: target_path = matches[0]
         elif file_type == "input_image":
-            p = Path(job.get("input_file_path", ""))
-            if p.exists(): target_path = p
+            target_path = resolve_input_image(job)
             
     if target_path is None or not target_path.exists():
         raise HTTPException(status_code=404, detail=f"Requested file '{file_type}' not found for job {job_id}")

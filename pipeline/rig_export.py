@@ -97,6 +97,8 @@ def create_rigged_glb(
 
     if joint_names is None:
         joint_names = [f"Bone_{i:03d}" for i in range(J)]
+    elif len(joint_names) < J:
+        joint_names = list(joint_names) + [f"Bone_{i:03d}" for i in range(len(joint_names), J)]
         
     if normals is None:
         tm = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
@@ -150,7 +152,7 @@ def create_rigged_glb(
     
     for i in range(J):
         node_def = {
-            "name": joint_names[i],
+            "name": joint_names[i] if i < len(joint_names) else f"Bone_{i:03d}",
             "translation": [float(c) for c in local_translations[i]],
             "rotation": [0.0, 0.0, 0.0, 1.0],
             "scale": [1.0, 1.0, 1.0]

@@ -212,10 +212,18 @@ async function loadSystemInfo() {
     const res = await fetch('/api/info');
     const data = await res.json();
     const lanElem = document.getElementById('lan-address');
-    if (data.lan_ips && data.lan_ips.length > 0) {
-      lanElem.textContent = `LAN: ${data.lan_ips[0]}:${data.port}`;
+    
+    // Ưu tiên IP vật lý của máy host (e.g. 192.168.1.43), loại bỏ IP container / VPN (10.8.x.x)
+    let hostIp = (data.lan_ips && data.lan_ips.length > 0) ? data.lan_ips[0] : null;
+    const currentHost = window.location.hostname;
+    if (currentHost && currentHost !== 'localhost' && currentHost !== '127.0.0.1' && !currentHost.startsWith('10.8.') && !currentHost.startsWith('172.')) {
+      hostIp = currentHost;
+    }
+
+    if (hostIp) {
+      lanElem.textContent = `LAN: ${hostIp}:${data.port}`;
       document.getElementById('lan-pill').onclick = () => {
-        const url = `http://${data.lan_ips[0]}:${data.port}`;
+        const url = `http://${hostIp}:${data.port}`;
         navigator.clipboard.writeText(url);
         alert(`Đã copy link LAN vào clipboard: ${url}`);
       };
@@ -406,7 +414,13 @@ function updateUIWithJob(job) {
   const imgPreviewCard = document.getElementById('image-preview-card');
   const imgPreviewElem = document.getElementById('image-preview-img');
 
-  const genName = (job.metadata?.generator === 'trellis' || job.metadata?.stage0?.model_used?.includes('TRELLIS')) ? 'TRELLIS.2-4B' : 'Tencent Hunyuan3D-2.1';
+  const genChoice = job.metadata?.generator || '';
+  const modelUsed = job.metadata?.stage0?.model_used || '';
+  const genName = (genChoice === 'pixal3d' || modelUsed.includes('Pixal3D'))
+    ? 'Pixal3D (SIGGRAPH 2026)'
+    : (genChoice === 'trellis' || modelUsed.includes('TRELLIS'))
+      ? 'TRELLIS.2-4B'
+      : 'Tencent Hunyuan3D-2.1';
 
   // Progress info from metadata
   const progress = job.metadata?.progress || {};
@@ -1066,7 +1080,26 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.classList.toggle('active', btn.getAttribute('data-generator') === gen);
     });
     if (genBadge) {
-      genBadge.textContent = gen === 'hunyuan3d' ? 'Hunyuan3D-2.1' : 'TRELLIS.2-4B';
+      if (gen === 'pixal3d') {
+        genBadge.textContent = 'Pixal3D';
+      } else if (gen === 'hunyuan3d') {
+        genBadge.textContent = 'Hunyuan3D-2.1';
+      } else {
+        genBadge.textContent = 'TRELLIS.2-4B';
+      }
+    }
+    const mvContainer = document.getElementById('mv-container');
+    if (mvContainer) {
+      mvContainer.style.display = (gen === 'pixal3d') ? 'block' : 'none';
+      if (gen !== 'pixal3d') {
+        // Reset về single view nếu chuyển sang model khác
+        document.getElementById('btn-view-single')?.classList.add('active');
+        document.getElementById('btn-view-multi')?.classList.remove('active');
+        const optBox = document.getElementById('mv-options-box');
+        if (optBox) optBox.style.display = 'none';
+        const stdUpload = document.getElementById('upload-zone');
+        if (stdUpload) stdUpload.style.display = 'block';
+      }
     }
   };
 
@@ -1162,6 +1195,157 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  // Pixal3D Multi-View View Mode & Upload Handlers
+  const btnViewSingle = document.getElementById('btn-view-single');
+  const btnViewMulti = document.getElementById('btn-view-multi');
+  const mvOptionsBox = document.getElementById('mv-options-box');
+  const mvSheetDropzone = document.getElementById('mv-sheet-dropzone');
+  const mvSheetInput = document.getElementById('mv-sheet-input');
+  const mv4viewsGrid = document.getElementById('mv-4views-grid');
+  const btnStartMv = document.getElementById('btn-start-mv');
+
+  let currentViewMode = 'single';
+  let currentMvType = 'turnaround';
+  const selected4Views = { front: null, right: null, back: null, left: null };
+
+  if (btnViewSingle && btnViewMulti) {
+    btnViewSingle.onclick = () => {
+      currentViewMode = 'single';
+      btnViewSingle.classList.add('active');
+      btnViewMulti.classList.remove('active');
+      if (mvOptionsBox) mvOptionsBox.style.display = 'none';
+      if (uploadZone) uploadZone.style.display = 'block';
+    };
+
+    btnViewMulti.onclick = () => {
+      currentViewMode = 'multi';
+      btnViewMulti.classList.add('active');
+      btnViewSingle.classList.remove('active');
+      if (mvOptionsBox) mvOptionsBox.style.display = 'block';
+      if (uploadZone) uploadZone.style.display = 'none';
+    };
+  }
+
+  document.querySelectorAll('input[name="mv_type_radio"]').forEach(radio => {
+    radio.onchange = (e) => {
+      currentMvType = e.target.value;
+      if (currentMvType === 'turnaround') {
+        if (mvSheetDropzone) mvSheetDropzone.style.display = 'block';
+        if (mv4viewsGrid) mv4viewsGrid.style.display = 'none';
+        if (btnStartMv) btnStartMv.style.display = 'none';
+      } else {
+        if (mvSheetDropzone) mvSheetDropzone.style.display = 'none';
+        if (mv4viewsGrid) mv4viewsGrid.style.display = 'grid';
+        if (btnStartMv) btnStartMv.style.display = 'flex';
+      }
+    };
+  });
+
+  if (mvSheetDropzone && mvSheetInput) {
+    mvSheetDropzone.onclick = () => mvSheetInput.click();
+    mvSheetInput.onchange = () => {
+      if (mvSheetInput.files.length > 0) {
+        handleMultiviewSheetUpload(mvSheetInput.files[0]);
+      }
+    };
+  }
+
+  async function handleMultiviewSheetUpload(file) {
+    if (!file) return;
+    const form = new FormData();
+    form.append('mv_type', 'turnaround');
+    form.append('file_sheet', file);
+    const isAutoFull = document.getElementById('chk-auto-full')?.checked ?? true;
+    form.append('mode', isAutoFull ? 'full' : '3d_only');
+    form.append('generator', 'pixal3d_mv');
+    form.append('mesh_detail', selectedDetail.mesh);
+    form.append('texture_detail', selectedDetail.texture);
+
+    try {
+      const res = await fetch('/api/jobs/upload_multiview', { method: 'POST', body: form });
+      if (res.ok) {
+        const job = await res.json();
+        activeJobId = job.id;
+        localStorage.setItem('unirig_active_job_id', job.id);
+        currentJobData = job;
+        smoothProgressVal = 10;
+        updateUIWithJob(job);
+        startPolling(job.id);
+        loadHistory();
+      }
+    } catch (err) {
+      console.error("MV Sheet upload error", err);
+    }
+  }
+
+  document.querySelectorAll('.mv-slot').forEach(slot => {
+    const slotName = slot.getAttribute('data-slot');
+    const input = slot.querySelector('input[type="file"]');
+    slot.onclick = (e) => {
+      e.stopPropagation();
+      input?.click();
+    };
+    if (input) {
+      input.onchange = () => {
+        if (input.files.length > 0) {
+          const f = input.files[0];
+          selected4Views[slotName] = f;
+          const statusElem = document.getElementById(`slot-${slotName}-status`);
+          if (statusElem) {
+            statusElem.textContent = f.name;
+            statusElem.style.color = '#34d399';
+            statusElem.style.fontWeight = '700';
+          }
+        }
+      };
+    }
+  });
+
+  if (btnStartMv) {
+    btnStartMv.onclick = async () => {
+      if (!selected4Views.front || !selected4Views.right || !selected4Views.back || !selected4Views.left) {
+        alert("Vui lòng chọn đầy đủ cả 4 ảnh: Front (0°), Sườn phải (270°), Back (180°), Sườn trái (90°)!");
+        return;
+      }
+      btnStartMv.disabled = true;
+      btnStartMv.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang tải lên & khởi chạy...';
+
+      const form = new FormData();
+      form.append('mv_type', '4views');
+      form.append('file_front', selected4Views.front);
+      form.append('file_right', selected4Views.right);
+      form.append('file_back', selected4Views.back);
+      form.append('file_left', selected4Views.left);
+      const isAutoFull = document.getElementById('chk-auto-full')?.checked ?? true;
+      form.append('mode', isAutoFull ? 'full' : '3d_only');
+      form.append('generator', 'pixal3d_mv');
+      form.append('mesh_detail', selectedDetail.mesh);
+      form.append('texture_detail', selectedDetail.texture);
+
+      try {
+        const res = await fetch('/api/jobs/upload_multiview', { method: 'POST', body: form });
+        if (res.ok) {
+          const job = await res.json();
+          activeJobId = job.id;
+          localStorage.setItem('unirig_active_job_id', job.id);
+          currentJobData = job;
+          smoothProgressVal = 10;
+          updateUIWithJob(job);
+          startPolling(job.id);
+          loadHistory();
+        } else {
+          const err = await res.json();
+          alert(`Lỗi: ${err.detail || 'Không thể tạo job Multi-View'}`);
+        }
+      } catch (err) {
+        console.error("4Views upload error", err);
+      } finally {
+        btnStartMv.disabled = false;
+        btnStartMv.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Bắt đầu xử lý Đa Góc Nhìn 360°';
+      }
+    };
+  }
+
   // Run Full Pipeline / Trigger Continuation Button
   const btnRunPipeline = document.getElementById('btn-run-pipeline');
   if (btnRunPipeline) {
@@ -1170,17 +1354,31 @@ document.addEventListener('DOMContentLoaded', () => {
         fileInput.click();
         return;
       }
+      const ext = currentJobData.input_filename ? currentJobData.input_filename.split('.').pop().toLowerCase() : '';
+      const isImg = ['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext) || !!currentJobData.metadata?.stage0;
+
       btnRunPipeline.disabled = true;
       btnRunPipeline.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang khởi chạy...';
       try {
-        const res = await fetch(`/api/jobs/${currentJobData.id}/continue_rigging`, { method: 'POST' });
+        let res;
+        // If image input, rerun full pipeline from Stage 0 with currently selected generator & details!
+        if (isImg) {
+          const form = new FormData();
+          form.append('generator', selectedGenerator);
+          form.append('mesh_detail', selectedDetail.mesh);
+          form.append('texture_detail', selectedDetail.texture);
+          res = await fetch(`/api/jobs/${currentJobData.id}/rerun`, { method: 'POST', body: form });
+        } else {
+          res = await fetch(`/api/jobs/${currentJobData.id}/continue_rigging`, { method: 'POST' });
+        }
+
         if (res.ok) {
-          smoothProgressVal = 20;
+          smoothProgressVal = 10;
           startPolling(currentJobData.id);
           loadHistory();
         } else {
           const err = await res.json();
-          alert(`Lỗi: ${err.detail || 'Không thể tiếp tục pipeline'}`);
+          alert(`Lỗi: ${err.detail || 'Không thể khởi chạy pipeline'}`);
         }
       } catch (e) {
         console.error("Error re-triggering pipeline", e);

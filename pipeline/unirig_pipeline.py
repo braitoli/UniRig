@@ -15,6 +15,7 @@ from .pan_retargeting import generate_pan_retargeted_animations
 from . import detail_presets
 from .trellis_generator import TrellisImageTo3DGenerator
 from .hunyuan3d_generator import Hunyuan3DImageTo3DGenerator
+from .pixal3d_generator import Pixal3DImageTo3DGenerator
 
 def auto_orient_and_center_mesh(
     vertices: np.ndarray,
@@ -339,10 +340,45 @@ class UniRigPipeline:
         except Exception:
             rel_input = input_p_str
             
-        # Run inference via run.py
+        # Ensure raw_data.npz exists in all locations get_files might look
+        npz_dir_p = Path(npz_dir)
+        source_npz = None
+        for cand in [
+            npz_dir_p / "raw_data.npz",
+            npz_dir_p / stem / "raw_data.npz",
+            npz_dir_p / Path(input_mesh_path).stem / "raw_data.npz",
+        ]:
+            if cand.exists():
+                source_npz = cand
+                break
+        if not source_npz:
+            matches = list(npz_dir_p.glob("**/raw_data.npz"))
+            if matches:
+                source_npz = matches[0]
+
+        if source_npz:
+            stem_in = Path(input_mesh_path).stem
+            (npz_dir_p / stem_in).mkdir(parents=True, exist_ok=True)
+            target_stem = npz_dir_p / stem_in / "raw_data.npz"
+            if not target_stem.exists():
+                try:
+                    shutil.copyfile(str(source_npz), str(target_stem))
+                except Exception:
+                    pass
+
+            try:
+                rel_stem = ".".join(os.path.relpath(str(input_mesh_path), os.getcwd()).split(".")[:-1])
+                target_dup = npz_dir_p / rel_stem / "raw_data.npz"
+                target_dup.parent.mkdir(parents=True, exist_ok=True)
+                if not target_dup.exists():
+                    shutil.copyfile(str(source_npz), str(target_dup))
+            except Exception:
+                pass
+
+        # Run inference via predict_skel_standalone.py
         cmd = [
             self.python_bin,
-            str(self.root_dir / "run.py"),
+            str(self.root_dir / "pipeline" / "predict_skel_standalone.py"),
             f"--task={self.config_skeleton}",
             f"--input={rel_input}",
             f"--output_dir={output_dir}",
@@ -352,7 +388,7 @@ class UniRigPipeline:
         
         env = os.environ.copy()
         env["PYTHONNOUSERSITE"] = "1"
-        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env.pop("CUDA_VISIBLE_DEVICES", None)
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         
         t0 = time.time()
@@ -693,18 +729,51 @@ class UniRigPipeline:
         output_glb_path = str(out_dir / f"{stem}_generated_3d.glb")
 
         gen_type = generator_type.lower().strip()
-        if gen_type in ["hunyuan3d", "hunyuan", "hunyuan3d-2.1", "hy3d"]:
+        if gen_type in ["pixal3d_mv", "pixal_mv"]:
+            generator = Pixal3DImageTo3DGenerator(model_id="TencentARC/Pixal3D")
+            # If image_path is a directory containing transforms.json, use directly
+            if os.path.isdir(image_path) and os.path.exists(os.path.join(image_path, "transforms.json")):
+                views_dir = image_path
+            else:
+                from pipeline.multiview_utils import split_turnaround_sheet
+                views_dir = str(out_dir / "mv_views")
+                split_turnaround_sheet(image_path, views_dir)
+
+            res = generator.generate_3d_from_multiview(
+                views_dir=views_dir,
+                output_glb_path=output_glb_path,
+                seed=seed,
+                progress_callback=progress_callback,
+                **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
+            )
+        elif gen_type in ["hunyuan3d", "hunyuan", "hunyuan3d-2.1", "hy3d"]:
             generator = Hunyuan3DImageTo3DGenerator(model_id="tencent/Hunyuan3D-2.1")
+            res = generator.generate_3d_mesh(
+                image_input=image_path,
+                output_glb_path=output_glb_path,
+                seed=seed,
+                progress_callback=progress_callback,
+                **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
+            )
+        elif gen_type in ["pixal3d", "pixal", "tencentarc/pixal3d", "pixal-3d"]:
+            generator = Pixal3DImageTo3DGenerator(model_id="TencentARC/Pixal3D")
+            res = generator.generate_3d_mesh(
+                image_input=image_path,
+                output_glb_path=output_glb_path,
+                seed=seed,
+                progress_callback=progress_callback,
+                **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
+            )
         else:
             generator = TrellisImageTo3DGenerator(model_id="microsoft/TRELLIS.2-4B")
+            res = generator.generate_3d_mesh(
+                image_input=image_path,
+                output_glb_path=output_glb_path,
+                seed=seed,
+                progress_callback=progress_callback,
+                **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
+            )
 
-        res = generator.generate_3d_mesh(
-            image_input=image_path,
-            output_glb_path=output_glb_path,
-            seed=seed,
-            progress_callback=progress_callback,
-            **detail_presets.resolve(gen_type, mesh_detail, texture_detail)
-        )
         res["mesh_detail"] = detail_presets.normalize(mesh_detail)
         res["texture_detail"] = detail_presets.normalize(texture_detail)
         return res
@@ -734,7 +803,12 @@ class UniRigPipeline:
 
         if ext in image_exts:
             # Stage 0: 2D Image to 3D Generation
-            gen_folder = "stage0_hunyuan3d" if "hunyuan" in generator_type.lower() else "stage0_trellis"
+            if "hunyuan" in generator_type.lower():
+                gen_folder = "stage0_hunyuan3d"
+            elif "pixal" in generator_type.lower():
+                gen_folder = "stage0_pixal3d"
+            else:
+                gen_folder = "stage0_trellis"
             stage0_dir = job_dir / gen_folder
             stage0_res = self.generate_3d_from_image(
                 image_path=input_path,

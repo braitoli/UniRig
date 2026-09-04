@@ -19,8 +19,9 @@ from typing import Dict
 LEVELS = ("preview", "standard", "high")
 DEFAULT_LEVEL = "high"
 
-# Accepted spellings of the Hunyuan3D generator, mirroring generate_3d_from_image.
+# Accepted spellings of the generators
 _HUNYUAN_ALIASES = ("hunyuan3d", "hunyuan", "hunyuan3d-2.1", "hy3d")
+_PIXAL_ALIASES = ("pixal3d", "pixal", "tencentarc/pixal3d", "pixal-3d", "pixal3d_mv", "pixal_mv")
 
 # The sampler step counts sit here rather than with the mesh sizes because diffusion is
 # where a preview's time actually goes: the mesh and bake stage runs in ~2.6s of a ~45s
@@ -57,9 +58,27 @@ _HUNYUAN_TEXTURE = {
     "high": {"paint_resolution": 768, "max_num_view": 9},
 }
 
+_PIXAL_MESH = {
+    "preview": {"resolution": "1024", "low_vram": False, "ss_sampling_steps": 6,
+                "shape_slat_sampling_steps": 6, "decimation_target": 100_000},
+    "standard": {"resolution": "1024", "low_vram": False, "ss_sampling_steps": 12,
+                 "shape_slat_sampling_steps": 12, "decimation_target": 300_000},
+    "high": {"resolution": "1536", "low_vram": False, "ss_sampling_steps": 12,
+             "shape_slat_sampling_steps": 12, "decimation_target": 1_000_000},
+}
+_PIXAL_TEXTURE = {
+    "preview": {"texture_size": 1024, "tex_slat_steps": 6},
+    "standard": {"texture_size": 2048, "tex_slat_steps": 12},
+    "high": {"texture_size": 4096, "tex_slat_steps": 12},
+}
+
 
 def is_hunyuan(generator_type: str) -> bool:
     return str(generator_type or "").lower().strip() in _HUNYUAN_ALIASES
+
+
+def is_pixal(generator_type: str) -> bool:
+    return str(generator_type or "").lower().strip() in _PIXAL_ALIASES
 
 
 def normalize(level) -> str:
@@ -75,4 +94,6 @@ def resolve(generator_type: str, mesh_detail=None, texture_detail=None) -> Dict:
     mesh, texture = normalize(mesh_detail), normalize(texture_detail)
     if is_hunyuan(generator_type):
         return {**_HUNYUAN_MESH[mesh], **_HUNYUAN_TEXTURE[texture]}
+    if is_pixal(generator_type):
+        return {**_PIXAL_MESH[mesh], **_PIXAL_TEXTURE[texture]}
     return {**_TRELLIS_MESH[mesh], **_TRELLIS_TEXTURE[texture]}

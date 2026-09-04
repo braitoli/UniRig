@@ -73,12 +73,15 @@
             <span><i class="fa-solid fa-wand-magic-sparkles"></i> AI Image-to-3D Model</span>
             <span id="generator-badge" style="font-size: 10px; color: var(--accent-cyan); background: rgba(0, 242, 254, 0.1); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(0, 242, 254, 0.2);">Hunyuan3D-2.1</span>
           </div>
-          <div class="generator-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+          <div class="generator-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;">
             <button type="button" class="generator-btn active" data-generator="hunyuan3d" id="btn-gen-hunyuan3d" title="Tencent Hunyuan3D-2.1 High-Resolution 3D Foundation Model">
-              <i class="fa-solid fa-ghost"></i> Hunyuan3D-2.1
+              <i class="fa-solid fa-ghost"></i> Hunyuan3D
             </button>
             <button type="button" class="generator-btn" data-generator="trellis" id="btn-gen-trellis" title="Microsoft TRELLIS.2-4B Unified 3D Model">
-              <i class="fa-solid fa-bolt"></i> TRELLIS.2-4B
+              <i class="fa-solid fa-bolt"></i> TRELLIS.2
+            </button>
+            <button type="button" class="generator-btn" data-generator="pixal3d" id="btn-gen-pixal3d" title="Tencent ARC Pixal3D (SIGGRAPH 2026) Pixel-Aligned 3D Generation">
+              <i class="fa-solid fa-cube"></i> Pixal3D
             </button>
           </div>
         </div>
@@ -107,7 +110,74 @@
           </div>
         </div>
 
-        <!-- Custom Upload -->
+        <!-- Pixal3D Multi-View Mode Switcher (Visible when Pixal3D is active) -->
+        <div id="mv-container" style="margin-bottom: 10px; display: none;">
+          <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between;">
+            <span><i class="fa-solid fa-camera-rotate"></i> Chế độ góc nhìn Pixal3D</span>
+            <span style="font-size: 10px; color: #a78bfa; background: rgba(167, 139, 250, 0.15); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(167, 139, 250, 0.3);">360° Fidelity</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+            <button type="button" class="generator-btn active" id="btn-view-single" data-view-mode="single">
+              <i class="fa-regular fa-image"></i> 1 Ảnh Đơn
+            </button>
+            <button type="button" class="generator-btn" id="btn-view-multi" data-view-mode="multi" title="Nạp 4 góc nhìn giúp tái tạo hoàn mỹ cả mặt trước, sườn và mặt sau 360 độ">
+              <i class="fa-solid fa-arrows-spin"></i> Đa Góc Nhìn (360°)
+            </button>
+          </div>
+
+          <!-- Multi-view upload selector -->
+          <div id="mv-options-box" style="display: none; background: rgba(0,0,0,0.3); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+            <div style="display: flex; gap: 12px; margin-bottom: 8px; flex-wrap: wrap;">
+              <label style="font-size: 11px; color: #fff; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+                <input type="radio" name="mv_type_radio" value="turnaround" checked style="accent-color: var(--accent-cyan); cursor: pointer;">
+                <span>1 Ảnh Ghép (Turnaround Sheet)</span>
+              </label>
+              <label style="font-size: 11px; color: #fff; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+                <input type="radio" name="mv_type_radio" value="4views" style="accent-color: var(--accent-cyan); cursor: pointer;">
+                <span>4 Ảnh Riêng Biệt</span>
+              </label>
+            </div>
+
+            <!-- Turnaround sheet dropzone -->
+            <div id="mv-sheet-dropzone" class="upload-dropzone" style="border: 2px dashed rgba(167, 139, 250, 0.6); padding: 14px; text-align: center; cursor: pointer; border-radius: 8px;">
+              <i class="fa-solid fa-table-columns" style="font-size: 22px; color: #a78bfa; margin-bottom: 6px;"></i>
+              <div style="font-size: 11px; font-weight: 600; color: #fff;" id="mv-sheet-label">Kéo thả ảnh Turnaround Sheet (1x4 hoặc 2x2)</div>
+              <div style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Tự động cắt 4 góc: Trước (0°), Phải (90°), Sau (180°), Trái (270°)</div>
+              <input type="file" id="mv-sheet-input" accept=".png,.jpg,.jpeg,.webp,.bmp" style="display: none;">
+            </div>
+
+            <!-- 4 Views Grid Dropzones -->
+            <div id="mv-4views-grid" style="display: none; grid-template-columns: 1fr 1fr; gap: 6px;">
+              <div class="upload-dropzone mv-slot" data-slot="front" style="padding: 8px; border: 1px dashed rgba(0, 242, 254, 0.4); border-radius: 6px; cursor: pointer; text-align: center;">
+                <div style="font-size: 10px; font-weight: 700; color: var(--accent-cyan);"><i class="fa-solid fa-user"></i> 1. Front (0°)</div>
+                <div class="slot-status" id="slot-front-status" style="font-size: 9px; color: var(--text-muted); margin-top: 3px;">Chưa chọn</div>
+                <input type="file" id="mv-input-front" accept=".png,.jpg,.jpeg,.webp" style="display: none;">
+              </div>
+              <div class="upload-dropzone mv-slot" data-slot="right" style="padding: 8px; border: 1px dashed rgba(167, 139, 250, 0.4); border-radius: 6px; cursor: pointer; text-align: center;">
+                <div style="font-size: 10px; font-weight: 700; color: #a78bfa;"><i class="fa-solid fa-arrow-right"></i> 2. Sườn phải (270°)</div>
+                <div class="slot-status" id="slot-right-status" style="font-size: 9px; color: var(--text-muted); margin-top: 3px;">Chưa chọn</div>
+                <input type="file" id="mv-input-right" accept=".png,.jpg,.jpeg,.webp" style="display: none;">
+              </div>
+              <div class="upload-dropzone mv-slot" data-slot="back" style="padding: 8px; border: 1px dashed rgba(251, 191, 36, 0.4); border-radius: 6px; cursor: pointer; text-align: center;">
+                <div style="font-size: 10px; font-weight: 700; color: #fbbf24;"><i class="fa-solid fa-arrow-down"></i> 3. Back (180°)</div>
+                <div class="slot-status" id="slot-back-status" style="font-size: 9px; color: var(--text-muted); margin-top: 3px;">Chưa chọn</div>
+                <input type="file" id="mv-input-back" accept=".png,.jpg,.jpeg,.webp" style="display: none;">
+              </div>
+              <div class="upload-dropzone mv-slot" data-slot="left" style="padding: 8px; border: 1px dashed rgba(52, 211, 153, 0.4); border-radius: 6px; cursor: pointer; text-align: center;">
+                <div style="font-size: 10px; font-weight: 700; color: #34d399;"><i class="fa-solid fa-arrow-left"></i> 4. Sườn trái (90°)</div>
+                <div class="slot-status" id="slot-left-status" style="font-size: 9px; color: var(--text-muted); margin-top: 3px;">Chưa chọn</div>
+                <input type="file" id="mv-input-left" accept=".png,.jpg,.jpeg,.webp" style="display: none;">
+              </div>
+            </div>
+
+            <!-- Start Multi-View Button -->
+            <button type="button" id="btn-start-mv" class="tool-btn" style="width: 100%; margin-top: 8px; justify-content: center; background: linear-gradient(135deg, #8b5cf6, #00f2fe); border: none; color: #fff; font-weight: 700; display: none; padding: 7px;">
+              <i class="fa-solid fa-wand-magic-sparkles"></i> Bắt đầu xử lý Đa Góc Nhìn 360°
+            </button>
+          </div>
+        </div>
+
+        <!-- Custom Upload (Single View / Standard 3D File) -->
         <div class="upload-dropzone" id="upload-zone">
           <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
           <div style="font-size: 12px; font-weight: 600; color: #fff;">Kéo thả ảnh 2D hoặc file 3D</div>
@@ -125,7 +195,7 @@
             <span class="status-badge completed" id="mode-badge" style="font-size: 10px;">3D + Rig + Motion</span>
           </div>
           <div id="mode-desc" style="font-size: 11px; color: var(--text-muted); margin-top: 5px; padding-left: 24px; line-height: 1.4;">
-            Sau khi tạo 3D từ ảnh 2D (Hunyuan3D-2.1 / TRELLIS.2), tự động dự đoán hệ xương và tạo 5 animation chuyển động.
+            Sau khi tạo 3D từ ảnh 2D (Pixal3D / Hunyuan3D-2.1 / TRELLIS.2), tự động dự đoán hệ xương và tạo 5 animation chuyển động.
           </div>
         </div>
 
@@ -156,7 +226,7 @@
                 <div class="step-name">2D Image → 3D Model</div>
                 <span id="step-0-badge" class="status-badge running" style="font-size: 9px; padding: 1px 6px; display: none;">0%</span>
               </div>
-              <div class="step-desc" id="step-0-desc">Tencent Hunyuan3D-2.1 / TRELLIS.2</div>
+              <div class="step-desc" id="step-0-desc">Pixal3D / Hunyuan3D-2.1 / TRELLIS.2</div>
             </div>
             <i class="fa-solid fa-check step-check" style="display: none; color: var(--accent-emerald);"></i>
           </div>
@@ -423,7 +493,7 @@
 
   </div>
 
-  <script src="/static/app.js?v=5.2"></script>
+  <script src="/static/app.js?v=6.4_mv"></script>
 </body>
 </html>
 

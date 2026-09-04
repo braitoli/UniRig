@@ -1,8 +1,14 @@
+import os
+import sys
+import torch
+if torch.cuda.is_available():
+    try:
+        torch.cuda.set_device(0)
+    except Exception:
+        pass
 import argparse
 import yaml
 from box import Box
-import os
-import torch
 import lightning as L
 if hasattr(torch.serialization, 'add_safe_globals'):
     try:
