@@ -1,0 +1,81 @@
+{
+  "hardware": "NVIDIA GB10 (GX10 DGX Spark ARM64)",
+  "duck": {
+    "orig": {
+      "job_id": "statue_1788536509_simple_duck_orig",
+      "job_dir": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536509_simple_duck_orig",
+      "title": "\u0110\u1ed1i s\u00e1nh: simple_duck (Nguy\u00ean b\u1ea3n)",
+      "target_faces": 0,
+      "stage0_time_sec": 185.0,
+      "pipeline_time_sec": 43.4,
+      "total_time_sec": 228.4,
+      "num_vertices": 148112,
+      "num_faces": 296022,
+      "files": {
+        "textured_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536509_simple_duck_orig/test_duck_textured.glb",
+        "package_zip": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536509_simple_duck_orig/test_duck_statue_package.zip"
+      }
+    },
+    "decimated_50k": {
+      "job_id": "statue_1788536552_simple_duck_50k",
+      "job_dir": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536552_simple_duck_50k",
+      "title": "\u0110\u1ed1i s\u00e1nh: simple_duck (50.000 m\u1eb7t)",
+      "target_faces": 50000,
+      "stage0_time_sec": 185.0,
+      "pipeline_time_sec": 32.79,
+      "total_time_sec": 217.79,
+      "num_vertices": 25114,
+      "num_faces": 49999,
+      "files": {
+        "textured_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536552_simple_duck_50k/test_duck_textured.glb",
+        "package_zip": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536552_simple_duck_50k/test_duck_statue_package.zip"
+      }
+    },
+    "comparison_image": "/home/braitoli/.gemini/antigravity-cli/brain/519b4581-1187-4004-8ba0-0b8b763c75a7/comparison_simple_duck.jpg"
+  },
+  "mecha": {
+    "orig": {
+      "job_id": "statue_1788536681_complex_mecha_orig",
+      "job_dir": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig",
+      "title": "\u0110\u1ed1i s\u00e1nh: complex_mecha (Nguy\u00ean b\u1ea3n)",
+      "target_faces": 0,
+      "stage0_time_sec": 210.0,
+      "pipeline_time_sec": 43.33,
+      "total_time_sec": 253.33,
+      "num_vertices": 226208,
+      "num_faces": 298010,
+      "files": {
+        "plaster_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_plaster.glb",
+        "segmented_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_segmented.glb",
+        "id_colored_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_id_colored.glb",
+        "textured_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_textured.glb",
+        "shell_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_shell.glb",
+        "shell_optimized_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_shell_optimized.glb",
+        "manifest_json": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_manifest.json",
+        "package_zip": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536681_complex_mecha_orig/test_mecha_statue_package.zip"
+      }
+    },
+    "decimated_50k": {
+      "job_id": "statue_1788536724_complex_mecha_50k",
+      "job_dir": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k",
+      "title": "\u0110\u1ed1i s\u00e1nh: complex_mecha (50.000 m\u1eb7t)",
+      "target_faces": 50000,
+      "stage0_time_sec": 210.0,
+      "pipeline_time_sec": 37.59,
+      "total_time_sec": 247.59,
+      "num_vertices": 45445,
+      "num_faces": 50000,
+      "files": {
+        "plaster_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_plaster.glb",
+        "segmented_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_segmented.glb",
+        "id_colored_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_id_colored.glb",
+        "textured_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_textured.glb",
+        "shell_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_shell.glb",
+        "shell_optimized_glb": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_shell_optimized.glb",
+        "manifest_json": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_manifest.json",
+        "package_zip": "/home/braitoli/workspace/namnh/code/poc/UniRig/playground/storage/statue_jobs/statue_1788536724_complex_mecha_50k/test_mecha_statue_package.zip"
+      }
+    },
+    "comparison_image": "/home/braitoli/.gemini/antigravity-cli/brain/519b4581-1187-4004-8ba0-0b8b763c75a7/comparison_complex_mecha.jpg"
+  }
+}
