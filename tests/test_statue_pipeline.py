@@ -24,6 +24,7 @@ from pipeline.statue_optimizer import (
     auto_ground_and_orient,
     add_statue_pedestal,
     decimate_mesh_for_statue,
+    create_max_optimized_shell,
     segment_statue_parts,
     export_all_statue_variants,
     STATUE_PALETTE
@@ -80,6 +81,34 @@ class TestStatueOptimizer(unittest.TestCase):
         decimated = decimate_mesh_for_statue(self.sample_mesh, target_faces=target)
         self.assertLessEqual(len(decimated.faces), orig_faces)
         self.assertGreater(len(decimated.faces), 0)
+
+    def test_bake_uv_khong_vuot_khoang_hop_le(self):
+        """
+        _bake_uv_from_source từng chọn 1 tam giác nguồn theo TÂM MẶT rồi ngoại suy
+        barycentric KHÔNG KẸP cho cả 3 góc — khi rút gọn mạnh (agg=5.0), góc xa tâm bị
+        văng UV ra ngoài [0,1] hàng chục lần, texture bake ra bị vụn/lộn xộn thay vì màu
+        gốc của model (bug thật đo được trên object sinh từ Trellis2 bên 3d-studio, vendor
+        file này được port nguyên văn từ UniRig: UV range [-10.07, -7.63] .. [8.83, 7.76]).
+        """
+        mesh = trimesh.creation.icosphere(subdivisions=4)  # 2562 verts, 5120 faces, closed
+        mesh.unmerge_vertices()  # mô phỏng mesh AI bị tách đỉnh tại đường khâu UV
+        v = trimesh.util.unitize(mesh.vertices)
+        uv = np.column_stack([
+            np.arctan2(v[:, 2], v[:, 0]) / (2 * np.pi) + 0.5,
+            np.arcsin(np.clip(v[:, 1], -1.0, 1.0)) / np.pi + 0.5,
+        ])
+        mesh.visual = trimesh.visual.TextureVisuals(
+            uv=uv, material=trimesh.visual.material.PBRMaterial()
+        )
+
+        rut_gon = create_max_optimized_shell(mesh, target_faces=800)
+
+        out_uv = np.asarray(rut_gon.visual.uv)
+        ngoai_khoang = int(((out_uv < -0.01) | (out_uv > 1.01)).any(axis=1).sum())
+        self.assertEqual(
+            ngoai_khoang, 0,
+            f"{ngoai_khoang}/{len(out_uv)} đỉnh có UV ngoài [0,1] — texture bake ra sẽ bị vụn/lộn xộn"
+        )
 
     def test_segment_statue_parts(self):
         seg = segment_statue_parts(self.sample_mesh, has_pedestal=False)

@@ -605,25 +605,17 @@ def _bake_uv_from_source(
     max_texture_dim: int = 1536
 ) -> trimesh.Trimesh:
     """
-    Gán lại UV cho mesh đã rút gọn bằng cách chiếu ngược lên mesh nguồn:
-    mỗi mặt lấy UV từ đúng MỘT tam giác nguồn (tam giác gần tâm mặt nhất) rồi nội suy
-    barycentric không kẹp cho cả 3 đỉnh, nên không có mặt nào vắt qua hai mảnh UV rời nhau.
+    Gán lại UV cho mesh đã rút gọn bằng cách chiếu ngược lên mesh nguồn: mỗi ĐỈNH góc tự
+    tìm điểm gần nhất TRÊN bề mặt mesh nguồn (không phải chọn 1 tam giác theo tâm mặt rồi
+    ngoại suy phẳng không kẹp cho cả 3 góc như bản cũ), nên UV nội suy luôn nằm trong tam
+    giác nguồn — không còn văng ra ngoài [0,1] hàng chục lần khiến texture bake bị vụn.
     """
     corners = dec_mesh.triangles
-    _, _, src_id = trimesh.proximity.closest_point(source, corners.mean(axis=1))
-    src_tri = np.repeat(source.triangles[src_id], 3, axis=0)
     pts = corners.reshape(-1, 3)
-
-    a = src_tri[:, 0]
-    e0, e1, dv = src_tri[:, 1] - a, src_tri[:, 2] - a, pts - a
-    d00 = (e0 * e0).sum(1); d01 = (e0 * e1).sum(1); d11 = (e1 * e1).sum(1)
-    d20 = (dv * e0).sum(1); d21 = (dv * e1).sum(1)
-    den = d00 * d11 - d01 * d01
-    den = np.where(np.abs(den) < 1e-20, 1e-20, den)
-    v = (d11 * d20 - d01 * d21) / den
-    w = (d00 * d21 - d01 * d20) / den
-    bary = np.stack([1.0 - v - w, v, w], axis=1)
-    uv = (np.repeat(source_uv[source.faces[src_id]], 3, axis=0) * bary[:, :, None]).sum(axis=1)
+    closest, _, src_id = trimesh.proximity.closest_point(source, pts)
+    src_tri = source.triangles[src_id]
+    bary = trimesh.triangles.points_to_barycentric(src_tri, closest)
+    uv = (source_uv[source.faces[src_id]] * bary[:, :, None]).sum(axis=1)
 
     # Hàn góc thành đỉnh theo DUNG SAI UV thật thay vì làm tròn theo lưới:
     # làm tròn bỏ sót cặp sát nhau nhưng rơi khác bin, nên phình 22.438 -> 61.214 đỉnh.
